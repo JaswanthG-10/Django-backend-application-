@@ -1,0 +1,194 @@
+"""Business service layer for managing extraction job workflows."""
+import logging
+from typing import Tuple, Optional, Dict, Any
+from uuid import UUID
+from django.db import transaction
+from django.utils import timezone
+from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
+from apps.extraction.selectors import get_job_by_id, get_active_job_by_token_hash
+from apps.extraction.clients import ThirdPartyExtractionClient
+from apps.common.exceptions import (
+    ResourceNotFoundError,
+    InvalidStateTransitionError,
+    DuplicateJobConflictError,
+    BaseDomainException,
+)
+
+logger = logging.getLogger('apps.extraction.services')
+
+
+class ExtractionService:
+    """Orchestrates job lifecycle transitions, deduplication, and data extraction pipelines."""
+
+    def __init__(self, client: Optional[ThirdPartyExtractionClient] = None):
+        self.client = client or ThirdPartyExtractionClient()
+
+    @transaction.atomic
+    def initiate_job(
+        self,
+        api_token: str,
+        source_type: str = SourceType.CRM,
+        metadata: Optional[Dict[str, Any]] = None,
+        deduplicate: bool = True,
+        strict_conflict: bool = False
+    ) -> Tuple[ExtractionJob, bool]:
+        """Creates a new extraction job or returns/conflicts on an active duplicate.
+        
+        Args:
+            api_token: Third-party API bearer token.
+            source_type: Data source domain name.
+            metadata: Optional dictionary with custom parameters or filters.
+            deduplicate: If True, checks for existing active job.
+            strict_conflict: If True and active job exists, raises DuplicateJobConflictError.
+            
+        Returns:
+            Tuple of (ExtractionJob instance, created_boolean).
+        """
+        token_hash = ExtractionJob.hash_token(api_token)
+        masked_token = ExtractionJob.mask_token(api_token)
+
+        if deduplicate:
+            active_job = get_active_job_by_token_hash(token_hash, source_type=source_type)
+            if active_job:
+                if strict_conflict:
+                    logger.warning("Duplicate active job detected (strict) for token=%s", masked_token)
+                    raise DuplicateJobConflictError(
+                        message=f"An active extraction job ({active_job.id}) is already in progress.",
+                        details={'job_id': str(active_job.id), 'status': active_job.status}
+                    )
+                logger.info("Found existing active extraction job %s for token=%s", active_job.id, masked_token)
+                return active_job, False
+
+        job = ExtractionJob.objects.create(
+            source_type=source_type,
+            token_hash=token_hash,
+            masked_token=masked_token,
+            status=JobStatus.PENDING,
+            metadata=metadata or {}
+        )
+        logger.info("Created new extraction job %s (status=pending, source=%s)", job.id, source_type)
+        return job, True
+
+    @transaction.atomic
+    def cancel_job(self, job_id: UUID) -> ExtractionJob:
+        """Cancels a pending or in-progress extraction job.
+        
+        Raises:
+            ResourceNotFoundError: If job ID is not found.
+            InvalidStateTransitionError: If job is already in a terminal state (completed, failed, cancelled).
+        """
+        job = get_job_by_id(job_id)
+        if not job:
+            raise ResourceNotFoundError(
+                message=f"Job with ID '{job_id}' not found.",
+                details={'job_id': str(job_id)}
+            )
+
+        if job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+            raise InvalidStateTransitionError(
+                message=f"Cannot cancel job in state '{job.status}'. Only pending or in-progress jobs can be cancelled.",
+                details={'job_id': str(job.id), 'current_status': job.status}
+            )
+
+        job.transition_to(
+            JobStatus.CANCELLED,
+            error_message="Job cancelled by user request."
+        )
+        logger.info("Extraction job %s successfully transitioned to CANCELLED.", job.id)
+        return job
+
+    @transaction.atomic
+    def remove_job_data(self, job_id: UUID) -> None:
+        """Removes an extraction job and all associated extracted records.
+        
+        Raises:
+            ResourceNotFoundError: If job ID is not found.
+        """
+        job = get_job_by_id(job_id)
+        if not job:
+            raise ResourceNotFoundError(
+                message=f"Job with ID '{job_id}' not found.",
+                details={'job_id': str(job_id)}
+            )
+
+        job_id_str = str(job.id)
+        job.delete()
+        logger.info("Extraction job %s and all associated records deleted.", job_id_str)
+
+    def process_extraction(
+        self,
+        job_id: UUID,
+        api_token: str,
+        mock_records: Optional[list] = None
+    ) -> ExtractionJob:
+        """Executes the extraction pipeline for a job.
+        
+        Fetches records from external provider, saves them in batch, and updates job status.
+        """
+        job = get_job_by_id(job_id)
+        if not job:
+            raise ResourceNotFoundError(f"Job with ID '{job_id}' not found.")
+
+        # Mark in progress
+        job.transition_to(JobStatus.IN_PROGRESS)
+
+        try:
+            if mock_records is not None:
+                records_data = mock_records
+            else:
+                filters = job.metadata.get('filters', {})
+                records_data = self.client.extract_data(
+                    api_token=api_token,
+                    source_type=job.source_type,
+                    filters=filters
+                )
+
+            # Persist extracted records using bulk_create
+            record_objects = []
+            seen_ids = set()
+
+            for item in records_data:
+                service_id = str(item.get('id_from_service') or item.get('id') or '')
+                if not service_id or service_id in seen_ids:
+                    continue
+                seen_ids.add(service_id)
+
+                record_objects.append(
+                    ExtractedRecord(
+                        job=job,
+                        id_from_service=service_id,
+                        email=item.get('email'),
+                        first_name=item.get('first_name', '')[:150],
+                        last_name=item.get('last_name', '')[:150],
+                        custom_fields=item.get('custom_fields', {}) or item.get('properties', {})
+                    )
+                )
+
+            with transaction.atomic():
+                if record_objects:
+                    ExtractedRecord.objects.bulk_create(record_objects, ignore_conflicts=True)
+                job.transition_to(
+                    JobStatus.COMPLETED,
+                    record_count=len(record_objects)
+                )
+
+            logger.info("Extraction job %s completed successfully with %d records.", job.id, len(record_objects))
+            return job
+
+        except BaseDomainException as exc:
+            logger.error("Domain exception during extraction for job %s: %s", job.id, exc.message)
+            job.transition_to(
+                JobStatus.FAILED,
+                error_message=exc.message,
+                error_details=exc.details
+            )
+            raise
+
+        except Exception as exc:
+            logger.exception("Unexpected error during extraction for job %s: %s", job.id, str(exc))
+            job.transition_to(
+                JobStatus.FAILED,
+                error_message="Unexpected internal error during data extraction.",
+                error_details={'reason': str(exc)}
+            )
+            raise
