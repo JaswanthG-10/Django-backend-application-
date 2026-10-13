@@ -1,6 +1,6 @@
 # GreenTree Data Extraction Service
 
-Production-quality Django REST API backend built for the GreenTree / Springer Capital backend development practical assessment. The application implements an asynchronous-ready, resilient data extraction pipeline with deterministic testing, state machine transitions, strict deduplication, decoupled external client adapters, and complete OpenAPI/Swagger documentation.
+Production-quality Django REST API backend built for the GreenTree / Springer Capital backend development practical assessment. The application implements an asynchronous, resilient data extraction pipeline with deterministic testing, state machine transitions, filter-aware deduplication, decoupled external client adapters, API key authentication, and complete OpenAPI/Swagger documentation.
 
 ---
 
@@ -13,6 +13,8 @@ Production-quality Django REST API backend built for the GreenTree / Springer Ca
 - [Requirements](#requirements)
 - [Installation & Local Setup](#installation--local-setup)
 - [Environment Variables](#environment-variables)
+- [API Authentication for Callers](#api-authentication-for-callers)
+- [Background Execution & Extraction Worker](#background-execution--extraction-worker)
 - [Database Setup & Migrations](#database-setup--migrations)
 - [Running the Application](#running-the-application)
 - [API Documentation (Swagger / ReDoc)](#api-documentation-swagger--redoc)
@@ -29,13 +31,16 @@ Production-quality Django REST API backend built for the GreenTree / Springer Ca
 The **Data Extraction Service** facilitates ingestion and extraction of entity records (contacts, leads, CRM entries) from third-party API providers into structured, queryable relational data.
 
 Key capabilities:
-1. **Asynchronous Scan Initiation (`/api/v1/scan/start`)**: Accepts extraction requests with token hashing and active-job deduplication, returning `202 Accepted`.
-2. **Status Polling & Progress Tracking (`/api/v1/scan/status/<job_id>`)**: Real-time lifecycle monitoring (`pending`, `in_progress`, `completed`, `failed`, `cancelled`).
-3. **Paginated Data Retrieval (`/api/v1/scan/result/<job_id>`)**: Enforces state validation (rejects incomplete jobs with `409 Conflict`), returning paginated entity records.
-4. **Controlled Cancellation (`/api/v1/scan/cancel/<job_id>`)**: Enforces strict state machine rules (prevents cancelling completed or failed jobs).
-5. **Data Cleanup & Purge (`/api/v1/scan/remove/<job_id>`)**: Atomic cascade deletion of extraction jobs and records.
-6. **Aggregated Analytics & Reporting (`/api/v1/jobs/statistics`, `/api/v1/jobs/analytics`)**: Single-query database aggregations for operational insights.
-7. **Production Health Check (`/api/v1/health`)**: Liveness and readiness probe with database connection verification.
+1. **Asynchronous Scan Initiation (`/api/v1/scan/start`)**: Accepts extraction requests with token hashing and filter-aware deduplication, immediately returning `202 Accepted` while dispatching background extraction.
+2. **Background Execution Pipeline**: Automatically runs extractions in a background worker thread upon trigger, or via the `run_extraction_worker` polling management command.
+3. **Multi-Page External Client with Retries**: Paginates through external endpoints, with automatic exponential backoff retries on HTTP 429 (Too Many Requests) and 5xx server errors, respecting `Retry-After` headers.
+4. **API Key Authentication**: Protects all mutation and retrieval endpoints using constant-time comparison against `API_KEY_SECRET` (`X-API-KEY` or `Authorization: Api-Key <key>`).
+5. **Status Polling & Progress Tracking (`/api/v1/scan/status/<job_id>`)**: Real-time lifecycle monitoring (`pending`, `in_progress`, `completed`, `failed`, `cancelled`) with sanitized error details that never leak internal tracebacks.
+6. **Paginated Data Retrieval (`/api/v1/scan/result/<job_id>`)**: Enforces state validation (rejects incomplete jobs with `409 Conflict`), returning paginated entity records.
+7. **Controlled Cancellation (`/api/v1/scan/cancel/<job_id>`)**: Enforces strict state machine rules (prevents cancelling completed or failed jobs).
+8. **Data Cleanup & Purge (`/api/v1/scan/remove/<job_id>`)**: Atomic cascade deletion of extraction jobs and records.
+9. **Aggregated Analytics & Reporting (`/api/v1/jobs/statistics`, `/api/v1/jobs/analytics`)**: Single-query database aggregations for operational insights.
+10. **Production Health Check (`/api/v1/health`)**: Public liveness and readiness probe with database connection verification.
 
 ---
 
@@ -46,7 +51,7 @@ Key capabilities:
 - **REST Framework:** Django REST Framework (DRF) 3.15+
 - **Database:** PostgreSQL (with automatic zero-dependency SQLite fallback for instant local setup)
 - **Configuration:** `python-decouple` & `dj-database-url` (strict environment variable separation)
-- **API Documentation:** `drf-spectacular` (OpenAPI 3.0 schema generation + Swagger UI + ReDoc)
+- **API Documentation:** `drf-spectacular` (OpenAPI 3.0 schema generation + Swagger UI + ReDoc with ApiKeyAuth)
 - **Test Automation:** `pytest`, `pytest-django`, `factory-boy`, `faker`
 - **WSGI / Production Server:** `gunicorn`
 - **CI / CD:** GitHub Actions with PostgreSQL matrix testing
@@ -61,11 +66,11 @@ The project adheres to a clean, decoupled **Layered Service Architecture**:
 ┌────────────────────────────────────────────────────────┐
 │                      HTTP Clients                      │
 └───────────────────────────┬────────────────────────────┘
-                            │
+                            │ (X-API-KEY Authentication)
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │                   API Views / URLs                     │  apps/extraction/views.py
-│  - HTTP Status Codes (200, 202, 204, 400, 404, 409)    │
+│  - HTTP Status Codes (200, 202, 204, 400, 401, 404, 409│
 │  - Swagger / OpenAPI AutoSchema annotations            │
 └─────────────┬───────────────────────────┬──────────────┘
               │                           │
@@ -80,7 +85,8 @@ The project adheres to a clean, decoupled **Layered Service Architecture**:
 ┌────────────────────────────────────────────────────────┐
 │                 Business Service Layer                 │  apps/extraction/services.py
 │  - ExtractionService (Job lifecycle & atomic workflows)│
-│  - Deduplication & state transition validation         │
+│  - Filter-aware deduplication & state validation       │
+│  - Asynchronous background worker dispatch             │
 └─────────────┬───────────────────────────┬──────────────┘
               │                           │
               ▼                           ▼
@@ -88,15 +94,16 @@ The project adheres to a clean, decoupled **Layered Service Architecture**:
 │   External HTTP Client   │  │    Query Selectors       │  apps/extraction/selectors.py
 │  apps/extraction/        │  │  - Single-query aggregates│
 │  clients.py              │  │  - N+1 prevention        │
-│  - Token masking in logs │  │  - Filtering & pagination │
-│  - Timeouts & retries    │  └───────────┬──────────────┘
-└──────────────────────────┘              │
-                                          ▼
+│  - Multi-page pagination │  │  - Filtering & pagination │
+│  - 429/5xx backoff retry │  └───────────┬──────────────┘
+│  - Token masking in logs │              │
+└──────────────────────────┘              ▼
                               ┌──────────────────────────┐
                               │     Database Models      │  apps/extraction/models.py
                               │  - State machine rules   │
                               │  - Composite indexes     │
                               │  - Unique constraints    │
+                              │  - dedup_hash (filters)  │
                               └──────────────────────────┘
 ```
 
@@ -125,6 +132,8 @@ Django-backend-application-/
 │   ├── __init__.py
 │   ├── common/                 # Reusable cross-cutting concerns
 │   │   ├── apps.py
+│   │   ├── authentication.py   # ApiKeyAuthentication backend
+│   │   ├── permissions.py      # HasServiceApiKey permission class
 │   │   ├── exceptions.py       # Custom domain exceptions & handler
 │   │   └── pagination.py       # Standard LimitOffset pagination
 │   │
@@ -139,18 +148,23 @@ Django-backend-application-/
 │       ├── selectors.py        # Optimized ORM queries & aggregations
 │       ├── clients.py          # ThirdPartyExtractionClient adapter
 │       │
+│       ├── management/
+│       │   └── commands/
+│       │       └── run_extraction_worker.py # Standalone polling worker
+│       │
 │       ├── migrations/
 │       │   ├── __init__.py
-│       │   └── 0001_initial.py
+│       │   ├── 0001_initial.py
+│       │   └── 0002_extractionjob_dedup_hash_and_more.py
 │       │
-│       └── tests/              # Automated test suite (60+ tests)
+│       └── tests/              # Automated test suite (72+ tests)
 │           ├── __init__.py
 │           ├── conftest.py     # Seeded fixtures & mock data
 │           ├── factories.py    # FactoryBoy model factories
 │           ├── test_models.py  # Model constraints & state machines
-│           ├── test_clients.py # External client & error mocks
-│           ├── test_services.py# Service orchestration & deduplication
-│           ├── test_api_scan.py# Scan workflow end-to-end tests
+│           ├── test_clients.py # External client, pagination & retry mocks
+│           ├── test_services.py# Service orchestration, deduplication & worker
+│           ├── test_api_scan.py# Scan workflow, auth & async execution tests
 │           ├── test_api_jobs.py# Jobs listing, filters, & statistics
 │           ├── test_edge_cases.py# Edge cases from Section 7 of guidelines
 │           └── test_performance.py# N+1 query count assertions
@@ -197,7 +211,6 @@ Django-backend-application-/
 
 4. **Configure environment variables:**
    ```bash
-   # Copy template
    cp .env.example .env
    ```
 
@@ -212,10 +225,45 @@ All settings are configured using decoupled environment variables. See [.env.exa
 | `SECRET_KEY` | *(django-insecure...)* | Django cryptographic secret key (change in production). |
 | `DEBUG` | `False` | Boolean flag toggling Django debug mode. |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,testserver` | Comma-separated list of allowed hostnames. |
+| `API_KEY_SECRET` | `greentree-default-service-key-2026` | Service API key required for incoming API calls. |
+| `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker threads on scan start. |
 | `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres). |
-| `EXTERNAL_API_BASE_URL` | `https://api.thirdparty-crm.com/v1` | Base URL of third-party CRM provider. |
+| `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
 | `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
 | `LOG_LEVEL` | `INFO` | Logging threshold level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
+
+---
+
+## API Authentication for Callers
+
+All protected API endpoints require the caller to authenticate using the configured `API_KEY_SECRET`.
+
+Provide the API key via any of the following HTTP headers:
+* `X-API-KEY: greentree-default-service-key-2026`
+* `Authorization: Api-Key greentree-default-service-key-2026`
+* `Authorization: Bearer greentree-default-service-key-2026`
+
+Unauthenticated requests receive `401 Unauthorized`. The operational health check (`/api/v1/health`) and OpenAPI schema views (`/api/docs/`) remain public for monitoring and documentation.
+
+---
+
+## Background Execution & Extraction Worker
+
+When `/api/v1/scan/start` is called:
+1. The endpoint validates input, hashes the token and filters, and persists the job in state `pending`.
+2. It returns `202 Accepted` with the `job_id` immediately.
+3. Because `EXTRACTION_ASYNC_EXECUTION=True`, a background worker thread is dispatched after database commit (`transaction.on_commit`), transitioning the job to `in_progress`, extracting and paginating through records from the external provider, and updating the job to `completed`.
+4. Subsequent calls to `/api/v1/scan/status/<job_id>` report progress and record count, and `/api/v1/scan/result/<job_id>` serves the extracted records.
+
+### Standalone Polling Worker Command
+Alternatively, extractions can be processed using the dedicated Django management command:
+```bash
+# Continuous polling loop (every 2 seconds)
+python manage.py run_extraction_worker --poll-interval 2.0
+
+# Run one pass and exit
+python manage.py run_extraction_worker --once
+```
 
 ---
 
@@ -247,7 +295,7 @@ The service is accessible at `http://127.0.0.1:8000/`.
 
 ## API Documentation (Swagger / ReDoc)
 
-Interactive OpenAPI 3.0 documentation is auto-generated via `drf-spectacular`:
+Interactive OpenAPI 3.0 documentation is auto-generated via `drf-spectacular` with `ApiKeyAuth` header support:
 
 - **Swagger UI:** [http://127.0.0.1:8000/api/docs/](http://127.0.0.1:8000/api/docs/)
 - **ReDoc:** [http://127.0.0.1:8000/api/redoc/](http://127.0.0.1:8000/api/redoc/)
@@ -259,15 +307,15 @@ Interactive OpenAPI 3.0 documentation is auto-generated via `drf-spectacular`:
 
 | Method | Endpoint | Description | Expected Status Codes |
 | :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/scan/start` | Initiates new extraction job or returns existing active job | `202 Accepted`, `400`, `409` |
-| `GET` | `/api/v1/scan/status/<job_id>` | Retrieves execution status, progress %, and metrics | `200 OK`, `404` |
-| `GET` | `/api/v1/scan/result/<job_id>` | Fetches paginated extracted records for completed job | `200 OK`, `404`, `409` |
-| `POST` | `/api/v1/scan/cancel/<job_id>` | Cancels a pending or in-progress extraction job | `200 OK`, `404`, `409` |
-| `DELETE` | `/api/v1/scan/remove/<job_id>` | Deletes extraction job and all associated records | `204 No Content`, `404` |
-| `GET` | `/api/v1/jobs/jobs` | Lists historical extraction jobs with filters & pagination | `200 OK` |
-| `GET` | `/api/v1/jobs/statistics` | Returns aggregated metrics across all jobs | `200 OK` |
-| `GET` | `/api/v1/jobs/analytics` | Provides analytics breakdown for charts & dashboard | `200 OK` |
-| `GET` | `/api/v1/health` | Operational health check (verifies database connection) | `200 OK`, `503` |
+| `POST` | `/api/v1/scan/start` | Initiates new extraction job and triggers background execution | `202 Accepted`, `400`, `401`, `409` |
+| `GET` | `/api/v1/scan/status/<job_id>` | Retrieves execution status, progress %, and metrics | `200 OK`, `401`, `404` |
+| `GET` | `/api/v1/scan/result/<job_id>` | Fetches paginated extracted records for completed job | `200 OK`, `401`, `404`, `409` |
+| `POST` | `/api/v1/scan/cancel/<job_id>` | Cancels a pending or in-progress extraction job | `200 OK`, `401`, `404`, `409` |
+| `DELETE` | `/api/v1/scan/remove/<job_id>` | Deletes extraction job and all associated records | `204 No Content`, `401`, `404` |
+| `GET` | `/api/v1/jobs/jobs` | Lists historical extraction jobs with filters & pagination | `200 OK`, `401` |
+| `GET` | `/api/v1/jobs/statistics` | Returns aggregated metrics across all jobs | `200 OK`, `401` |
+| `GET` | `/api/v1/jobs/analytics` | Provides analytics breakdown for charts & dashboard | `200 OK`, `401` |
+| `GET` | `/api/v1/health` | Operational health check (verifies database connection) | `200 OK`, `503` (Public) |
 
 ### Standard Error Envelope
 
@@ -293,36 +341,44 @@ The test suite is built strictly against the **[GreenTree Test Guidelines V1.md]
 pytest -v
 ```
 
-### Test Categories Covered
+### Test Categories Covered (72 Automated Tests)
 
-1. **Seeded Data Tests:**
-   - Pre-populated jobs in different states (`pending`, `in_progress`, `completed`, `failed`, `cancelled`).
-   - Verifies status reporting, result schemas, and statistics calculation deterministically.
-2. **Scan Workflow Integration Tests:**
-   - End-to-end execution of steps 1 through 8 from the GreenTree test specification.
-   - Header-based and body-based API token authentication.
-   - Immediate verification of state changes upon cancellation and cascading deletion upon removal.
-3. **Edge Case Tests:**
+1. **API Authentication Tests:**
+   - Verifies missing API key returns `401 Unauthorized`.
+   - Verifies invalid API key returns `401 Unauthorized`.
+   - Verifies public health check remains accessible without credentials.
+2. **Background Worker Execution Tests:**
+   - Tests end-to-end background thread extraction: triggering `/scan/start`, background processing, and retrieving completed records via `/scan/result/<job_id>`.
+   - Tests `manage.py run_extraction_worker --once` polling execution.
+3. **Filter-Aware Deduplication Tests:**
+   - Scans with different `filters` create distinct jobs.
+   - Scans with identical `filters` (even with reordered JSON keys) reuse the existing active job.
+4. **Error Sanitization Tests:**
+   - Failed jobs store clean diagnostic codes in `error_details` without leaking internal Python exceptions, database passwords, or filesystem tracebacks.
+5. **Third-Party Client Unit Tests:**
+   - Multi-page pagination traversal across pages.
+   - Exponential backoff retries on HTTP 429 (respecting `Retry-After`) and 5xx server errors.
+   - Token masking in logs.
+6. **Scan Workflow Integration Tests:**
+   - Steps 1 through 8 from GreenTree test guidelines (`start` → `status` → `result` → `cancel` → `remove` → verify 404).
+7. **Edge Case Tests:**
    - Missing, empty, whitespace-only, or short API tokens (`400 Bad Request`).
    - Malformed JSON payloads (`400 Bad Request`).
    - Non-existent UUIDs and SQL injection / non-standard ID attempts (`404 Not Found`).
-   - Fetching results on incomplete or failed jobs (`409 Conflict` with `JOB_NOT_COMPLETED`).
+   - Accessing results on incomplete or failed jobs (`409 Conflict` with `JOB_NOT_COMPLETED`).
    - Cancelling already completed, failed, or cancelled jobs (`409 Conflict`).
-   - Concurrent requests for duplicate extraction with `strict_deduplication=True` (`409 Conflict`).
+   - Concurrent duplicate scans with `strict_deduplication=True` (`409 Conflict`).
    - Extreme pagination bounds (oversized limit bounded to 100, out-of-range offset).
-4. **Third-Party Client Unit Tests:**
-   - Isolated testing of `ThirdPartyExtractionClient` with mocked network responses.
-   - Verification of HTTP 401/403, 404, 429 (rate limiting), 500/503 server errors, network timeouts, and non-JSON malformed responses.
-   - Assertions ensuring authorization tokens are masked in logs and never exposed in plaintext.
-5. **N+1 Query Performance Tests:**
+8. **N+1 Query Performance Tests:**
    - Query count assertions using `django_assert_num_queries` ensuring result listing and job listing maintain constant query counts regardless of dataset volume.
 
 ---
 
 ## Security & Compliance
 
-- **No Secret Persistence:** The raw API token is never stored in plaintext in the database. Instead, a one-way deterministic SHA-256 hash (`token_hash`) is indexed for deduplication, and a masked representation (e.g. `pat***1234`) is kept for audit visibility.
-- **Traceback Protection:** In production, unhandled 500 errors return a sanitized JSON message without exposing Python stack traces or framework internals.
+- **Caller Authentication:** Mandatory API Key (`X-API-KEY`) validated with constant-time comparison.
+- **No Secret Persistence:** The raw third-party API token is never stored in plaintext in the database. A deterministic SHA-256 hash (`token_hash`) is indexed for deduplication, and a masked representation (e.g. `pat***1234`) is kept for audit visibility.
+- **Traceback & Error Sanitization:** In production, unhandled errors and failed extraction jobs return sanitized JSON diagnostics without exposing Python stack traces, internal paths, or framework internals.
 - **Input Sanitization:** URL parameters and payload fields undergo strict validation and UUID parsing before reaching the ORM.
 
 ---
@@ -350,6 +406,7 @@ CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers
 
 ## Assumptions & Design Decisions
 
-1. **Token Deduplication:** Because third-party API tokens are sensitive, we hash tokens with SHA-256 upon arrival. When a new scan is started with identical parameters and an active job already exists (`pending` or `in_progress`), the API either returns the existing job ID (idempotent behavior) or responds with `409 Conflict` if `strict_deduplication=True` is provided.
-2. **Pagination Standard:** `StandardLimitOffsetPagination` was chosen to align with the GreenTree test guidelines (`limit` and `offset` query parameters) while bounding requests to a safe upper limit of 100 records per page.
-3. **Database Flexibility:** The application defaults to SQLite locally for zero-friction setup and evaluation, while seamlessly connecting to PostgreSQL when `DATABASE_URL` is set in production or GitHub Actions CI.
+1. **Filter-Aware Deduplication:** Deduplication computes a composite SHA-256 hash of `api_token + source_type + normalized_filters`. Different filters create distinct jobs, whereas identical filters prevent duplicate concurrent scans.
+2. **Asynchronous Execution:** By default (`EXTRACTION_ASYNC_EXECUTION=True`), jobs are picked up immediately by a background worker thread upon trigger, allowing zero-dependency local and production execution without requiring Celery/Redis, while also providing a standalone `run_extraction_worker` management command for separated worker architectures.
+3. **Pagination Standard:** `StandardLimitOffsetPagination` was chosen to align with the GreenTree test guidelines (`limit` and `offset` query parameters) while bounding requests to a safe upper limit of 100 records per page.
+4. **Database Flexibility:** The application defaults to SQLite locally for zero-friction setup and evaluation, while seamlessly connecting to PostgreSQL when `DATABASE_URL` is set in production or GitHub Actions CI.

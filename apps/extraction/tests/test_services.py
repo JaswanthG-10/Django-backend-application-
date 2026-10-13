@@ -41,6 +41,40 @@ class TestExtractionService:
         assert created2 is False
         assert job1.id == job2.id
 
+    def test_initiate_job_different_filters_creates_distinct_jobs(self):
+        service = ExtractionService()
+        job1, created1 = service.initiate_job(
+            api_token="same-token-123",
+            source_type="crm",
+            metadata={'filters': {'stage': 'lead'}}
+        )
+        assert created1 is True
+
+        job2, created2 = service.initiate_job(
+            api_token="same-token-123",
+            source_type="crm",
+            metadata={'filters': {'stage': 'customer'}}
+        )
+        assert created2 is True
+        assert job1.id != job2.id
+
+    def test_initiate_job_identical_filters_different_key_order_reuses_job(self):
+        service = ExtractionService()
+        job1, created1 = service.initiate_job(
+            api_token="same-token-456",
+            source_type="crm",
+            metadata={'filters': {'a': 1, 'b': 2}}
+        )
+        assert created1 is True
+
+        job2, created2 = service.initiate_job(
+            api_token="same-token-456",
+            source_type="crm",
+            metadata={'filters': {'b': 2, 'a': 1}}
+        )
+        assert created2 is False
+        assert job1.id == job2.id
+
     def test_initiate_job_strict_conflict_raises(self):
         service = ExtractionService()
         service.initiate_job(
@@ -110,5 +144,40 @@ class TestExtractionService:
 
         job = ExtractionJob.objects.get(id=seeded_pending_job.id)
         assert job.status == JobStatus.FAILED
-        assert "Provider 500 error" in job.error_message
-        assert job.error_details == {"code": 500}
+        assert job.error_details.get('code') == 'EXTERNAL_SERVICE_ERROR'
+        assert job.error_details.get('category') == 'external_service_error'
+
+    def test_process_extraction_unexpected_exception_does_not_leak_internals(self, seeded_pending_job):
+        mock_client = MagicMock()
+        mock_client.extract_data.side_effect = RuntimeError("database pass=secret123 connection lost at /app/internal.py")
+
+        service = ExtractionService(client=mock_client)
+        with pytest.raises(RuntimeError):
+            service.process_extraction(
+                job_id=seeded_pending_job.id,
+                api_token="valid-test-token"
+            )
+
+        job = ExtractionJob.objects.get(id=seeded_pending_job.id)
+        assert job.status == JobStatus.FAILED
+        assert job.error_details == {
+            'code': 'INTERNAL_EXTRACTION_FAILURE',
+            'category': 'internal_server_error'
+        }
+        # Verify secret string was never leaked into error_details
+        assert "secret123" not in str(job.error_details)
+        assert "/app/internal.py" not in str(job.error_details)
+
+    def test_run_extraction_worker_command_once(self, seeded_pending_job, sample_external_api_payload):
+        from django.core.management import call_command
+        from io import StringIO
+        from unittest.mock import patch
+
+        out = StringIO()
+        with patch('apps.extraction.clients.ThirdPartyExtractionClient.extract_data', return_value=sample_external_api_payload):
+            call_command('run_extraction_worker', '--once', stdout=out)
+
+        seeded_pending_job.refresh_from_db()
+        assert seeded_pending_job.status == JobStatus.COMPLETED
+        assert seeded_pending_job.record_count == 3
+        assert "Successfully completed job" in out.getvalue()

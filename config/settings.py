@@ -121,6 +121,11 @@ REST_FRAMEWORK = {
         'rest_framework.parsers.FormParser',
         'rest_framework.parsers.MultiPartParser',
     ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'apps.common.authentication.ApiKeyAuthentication',
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.BasicAuthentication',
+    ],
     'DEFAULT_PAGINATION_CLASS': 'apps.common.pagination.StandardLimitOffsetPagination',
     'PAGE_SIZE': 20,
     'DEFAULT_FILTER_BACKENDS': [
@@ -147,10 +152,28 @@ SPECTACULAR_SETTINGS = {
         {'name': 'Job Analytics & Management', 'description': 'Endpoints for listing historical jobs and querying aggregated metrics.'},
         {'name': 'Health', 'description': 'Service operational health check.'},
     ],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'ApiKeyAuth': {
+                'type': 'apiKey',
+                'in': 'header',
+                'name': 'X-API-KEY',
+                'description': 'Enter service API key to authenticate requests',
+            }
+        }
+    },
+    'SECURITY': [{'ApiKeyAuth': []}],
 }
 
+# API Key Security for API Callers
+API_KEY_SECRET = config('API_KEY_SECRET', default='greentree-default-service-key-2026')
+
+# Asynchronous background execution (worker / thread runner)
+EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
+
 # External Extraction Service Client Configuration
-EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://api.thirdparty-crm.com/v1')
+# Defaults to jsonplaceholder.typicode.com as a live accessible data source, or any CRM URL
+EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://jsonplaceholder.typicode.com')
 EXTERNAL_API_TIMEOUT = config('EXTERNAL_API_TIMEOUT', default=10, cast=int)
 EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='')
 

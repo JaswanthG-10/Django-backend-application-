@@ -145,3 +145,106 @@ class TestScanWorkflowApi:
         # Results check should also return 404
         result_url = reverse('extraction:scan-result', kwargs={'job_id': job.id})
         assert api_client.get(result_url).status_code == status.HTTP_404_NOT_FOUND
+
+    def test_unauthenticated_request_rejected(self, unauthenticated_client):
+        """API caller security: Unauthenticated requests without API key receive 401."""
+        url = reverse('extraction:scan-start')
+        response = unauthenticated_client.post(url, data={'api_token': 'secret-tok-123'}, format='json')
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_invalid_api_key_rejected(self, unauthenticated_client):
+        """API caller security: Invalid API key receives 401."""
+        url = reverse('extraction:jobs-list')
+        response = unauthenticated_client.get(url, HTTP_X_API_KEY='invalid-wrong-key')
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+
+    def test_health_check_public_without_auth(self, unauthenticated_client):
+        """Public health endpoint: Accessible without API key for monitoring."""
+        url = reverse('extraction:health-check')
+        response = unauthenticated_client.get(url)
+        assert response.status_code == status.HTTP_200_OK
+
+    @pytest.mark.django_db(transaction=True)
+    def test_background_async_extraction_execution(self, api_client, settings):
+        """Background execution: When async execution is enabled, worker thread processes the job."""
+        import time
+        from unittest.mock import patch
+
+        settings.EXTRACTION_ASYNC_EXECUTION = True
+
+        mock_payload = [
+            {'id': 'bg_rec_1', 'email': 'bg1@test.com', 'first_name': 'Background', 'last_name': 'Worker'},
+            {'id': 'bg_rec_2', 'email': 'bg2@test.com', 'first_name': 'Async', 'last_name': 'Task'}
+        ]
+
+        with patch('apps.extraction.clients.ThirdPartyExtractionClient.extract_data', return_value=mock_payload):
+            start_url = reverse('extraction:scan-start')
+            resp = api_client.post(start_url, data={'api_token': 'async-run-token-99'}, format='json')
+            assert resp.status_code == status.HTTP_202_ACCEPTED
+            job_id = resp.json()['job_id']
+
+            # Give background worker thread up to 2 seconds to complete processing
+            max_wait = 20
+            completed = False
+            for _ in range(max_wait):
+                time.sleep(0.1)
+                job = ExtractionJob.objects.get(id=job_id)
+                if job.status == JobStatus.COMPLETED:
+                    completed = True
+                    break
+
+            assert completed is True
+            assert job.record_count == 2
+
+            # Now verify /scan/result/<job_id> returns 200 OK with records
+            result_url = reverse('extraction:scan-result', kwargs={'job_id': job_id})
+            result_resp = api_client.get(result_url)
+            assert result_resp.status_code == status.HTTP_200_OK
+            assert result_resp.json()['count'] == 2
+
+    def test_filter_deduplication_via_api(self, api_client):
+        """Deduplication: Different filters create distinct jobs; identical filters reuse active job."""
+        url = reverse('extraction:scan-start')
+
+        # Request 1 with filter A
+        resp1 = api_client.post(
+            url,
+            data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
+            format='json'
+        )
+        assert resp1.status_code == status.HTTP_202_ACCEPTED
+        job_id_1 = resp1.json()['job_id']
+        assert resp1.json()['is_existing'] is False
+
+        # Request 2 with filter B (different)
+        resp2 = api_client.post(
+            url,
+            data={'api_token': 'filter-token-1', 'filters': {'segment': 'smb'}},
+            format='json'
+        )
+        assert resp2.status_code == status.HTTP_202_ACCEPTED
+        job_id_2 = resp2.json()['job_id']
+        assert resp2.json()['is_existing'] is False
+        assert job_id_1 != job_id_2
+
+        # Request 3 with filter A (identical to Request 1)
+        resp3 = api_client.post(
+            url,
+            data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
+            format='json'
+        )
+        assert resp3.status_code == status.HTTP_202_ACCEPTED
+        assert resp3.json()['job_id'] == job_id_1
+        assert resp3.json()['is_existing'] is True
+
+    def test_error_details_sanitized_in_status_response(self, api_client, seeded_failed_job):
+        """Status API: Never leaks raw tracebacks or internal exceptions in error_details."""
+        url = reverse('extraction:scan-status', kwargs={'job_id': seeded_failed_job.id})
+        response = api_client.get(url)
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['status'] == 'failed'
+        # Ensure error details does not contain tracebacks or internal file paths
+        details_str = str(data['error_details'])
+        assert 'Traceback' not in details_str
+        assert 'line ' not in details_str

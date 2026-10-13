@@ -15,6 +15,16 @@ def get_job_by_id(job_id: UUID) -> Optional[ExtractionJob]:
         return None
 
 
+def get_active_job_by_dedup_hash(dedup_hash: str) -> Optional[ExtractionJob]:
+    """Finds an existing active (pending or in_progress) job matching identical token + source + filters."""
+    if not dedup_hash:
+        return None
+    return ExtractionJob.objects.filter(
+        dedup_hash=dedup_hash,
+        status__in=[JobStatus.PENDING, JobStatus.IN_PROGRESS]
+    ).first()
+
+
 def get_active_job_by_token_hash(token_hash: str, source_type: str = 'crm') -> Optional[ExtractionJob]:
     """Finds an existing active (pending or in_progress) job for deduplication."""
     return ExtractionJob.objects.filter(

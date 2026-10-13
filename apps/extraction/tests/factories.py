@@ -12,6 +12,7 @@ class ExtractionJobFactory(factory.django.DjangoModelFactory):
     id = factory.LazyFunction(uuid.uuid4)
     source_type = SourceType.CRM
     token_hash = factory.LazyAttribute(lambda o: ExtractionJob.hash_token("test-secret-api-token"))
+    dedup_hash = factory.LazyAttribute(lambda o: ExtractionJob.compute_dedup_hash("test-secret-api-token", o.source_type, getattr(o, 'metadata', {}).get('filters') if hasattr(o, 'metadata') else {}))
     masked_token = "tes***oken"
     status = JobStatus.PENDING
     record_count = 0

@@ -1,11 +1,12 @@
 """Business service layer for managing extraction job workflows."""
 import logging
+import threading
 from typing import Tuple, Optional, Dict, Any
 from uuid import UUID
-from django.db import transaction
+from django.db import transaction, connection
 from django.utils import timezone
 from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
-from apps.extraction.selectors import get_job_by_id, get_active_job_by_token_hash
+from apps.extraction.selectors import get_job_by_id, get_active_job_by_dedup_hash
 from apps.extraction.clients import ThirdPartyExtractionClient
 from apps.common.exceptions import (
     ResourceNotFoundError,
@@ -23,6 +24,30 @@ class ExtractionService:
     def __init__(self, client: Optional[ThirdPartyExtractionClient] = None):
         self.client = client or ThirdPartyExtractionClient()
 
+    @classmethod
+    def dispatch_background_extraction(cls, job_id: UUID, api_token: str) -> None:
+        """Dispatches extraction to an asynchronous background worker thread.
+        
+        Guarantees that the job transitions through pending -> in_progress -> completed (or failed)
+        in real production execution without blocking the 202 Accepted HTTP response.
+        """
+        def _worker():
+            try:
+                connection.close()
+                service = cls()
+                service.process_extraction(job_id=job_id, api_token=api_token)
+            except Exception as exc:
+                logger.warning("Background extraction task completed with status update for job %s: %s", job_id, exc)
+            finally:
+                connection.close()
+
+        worker_thread = threading.Thread(
+            target=_worker,
+            name=f"extraction-worker-{job_id}",
+            daemon=True
+        )
+        worker_thread.start()
+
     @transaction.atomic
     def initiate_job(
         self,
@@ -34,21 +59,20 @@ class ExtractionService:
     ) -> Tuple[ExtractionJob, bool]:
         """Creates a new extraction job or returns/conflicts on an active duplicate.
         
-        Args:
-            api_token: Third-party API bearer token.
-            source_type: Data source domain name.
-            metadata: Optional dictionary with custom parameters or filters.
-            deduplicate: If True, checks for existing active job.
-            strict_conflict: If True and active job exists, raises DuplicateJobConflictError.
-            
-        Returns:
-            Tuple of (ExtractionJob instance, created_boolean).
+        Deduplication checks token_hash + source_type + normalized filters. If filters differ,
+        a new distinct job is created.
         """
+        filters = (metadata or {}).get('filters', {})
+        dedup_hash = ExtractionJob.compute_dedup_hash(
+            raw_token=api_token,
+            source_type=source_type,
+            filters=filters
+        )
         token_hash = ExtractionJob.hash_token(api_token)
         masked_token = ExtractionJob.mask_token(api_token)
 
         if deduplicate:
-            active_job = get_active_job_by_token_hash(token_hash, source_type=source_type)
+            active_job = get_active_job_by_dedup_hash(dedup_hash)
             if active_job:
                 if strict_conflict:
                     logger.warning("Duplicate active job detected (strict) for token=%s", masked_token)
@@ -56,12 +80,13 @@ class ExtractionService:
                         message=f"An active extraction job ({active_job.id}) is already in progress.",
                         details={'job_id': str(active_job.id), 'status': active_job.status}
                     )
-                logger.info("Found existing active extraction job %s for token=%s", active_job.id, masked_token)
+                logger.info("Found existing active extraction job %s for dedup_hash=%s", active_job.id, dedup_hash[:8])
                 return active_job, False
 
         job = ExtractionJob.objects.create(
             source_type=source_type,
             token_hash=token_hash,
+            dedup_hash=dedup_hash,
             masked_token=masked_token,
             status=JobStatus.PENDING,
             metadata=metadata or {}
@@ -124,6 +149,7 @@ class ExtractionService:
         """Executes the extraction pipeline for a job.
         
         Fetches records from external provider, saves them in batch, and updates job status.
+        Never stores raw tracebacks or internal exception text into error_details.
         """
         job = get_job_by_id(job_id)
         if not job:
@@ -177,18 +203,29 @@ class ExtractionService:
 
         except BaseDomainException as exc:
             logger.error("Domain exception during extraction for job %s: %s", job.id, exc.message)
+            # Sanitize error_details to prevent internal leaks
+            safe_details = {
+                'code': getattr(exc, 'code', 'EXTRACTION_ERROR'),
+                'category': 'external_service_error'
+            }
+            if isinstance(exc.details, dict) and 'status_code' in exc.details:
+                safe_details['status_code'] = exc.details['status_code']
             job.transition_to(
                 JobStatus.FAILED,
                 error_message=exc.message,
-                error_details=exc.details
+                error_details=safe_details
             )
             raise
 
         except Exception as exc:
             logger.exception("Unexpected error during extraction for job %s: %s", job.id, str(exc))
+            # Never leak raw str(exc), tracebacks, or internal database errors to client status
             job.transition_to(
                 JobStatus.FAILED,
                 error_message="Unexpected internal error during data extraction.",
-                error_details={'reason': str(exc)}
+                error_details={
+                    'code': 'INTERNAL_EXTRACTION_FAILURE',
+                    'category': 'internal_server_error'
+                }
             )
             raise

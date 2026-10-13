@@ -11,9 +11,27 @@ from apps.extraction.tests.factories import (
 )
 
 
+from django.conf import settings
+
+
+@pytest.fixture(autouse=True)
+def disable_async_extraction_for_unit_tests(settings):
+    """Disables background worker threads by default during unit tests for deterministic assertions."""
+    settings.EXTRACTION_ASYNC_EXECUTION = False
+
+
 @pytest.fixture
 def api_client():
-    """Provides a fresh DRF APIClient."""
+    """Provides a fresh DRF APIClient authenticated with the service API key."""
+    client = APIClient()
+    key = getattr(settings, 'API_KEY_SECRET', 'greentree-default-service-key-2026')
+    client.credentials(HTTP_X_API_KEY=key)
+    return client
+
+
+@pytest.fixture
+def unauthenticated_client():
+    """Provides an unauthenticated DRF APIClient without the service API key."""
     return APIClient()
 
 

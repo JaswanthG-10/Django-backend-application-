@@ -51,6 +51,13 @@ class ExtractionJob(models.Model):
         db_index=True,
         help_text="SHA-256 hash of the API token used for deduplication without storing plaintext."
     )
+    dedup_hash = models.CharField(
+        max_length=64,
+        db_index=True,
+        blank=True,
+        default='',
+        help_text="SHA-256 hash of token + source_type + normalized filters for comprehensive deduplication."
+    )
     masked_token = models.CharField(
         max_length=64,
         blank=True,
@@ -110,6 +117,7 @@ class ExtractionJob(models.Model):
         indexes = [
             models.Index(fields=['status', 'created_at'], name='job_status_created_idx'),
             models.Index(fields=['token_hash', 'status'], name='job_token_status_idx'),
+            models.Index(fields=['dedup_hash', 'status'], name='job_dedup_status_idx'),
             models.Index(fields=['source_type', 'status'], name='job_source_status_idx'),
         ]
 
@@ -120,6 +128,14 @@ class ExtractionJob(models.Model):
     def hash_token(raw_token: str) -> str:
         """Produces a deterministic SHA-256 hash of the API token."""
         return hashlib.sha256(raw_token.strip().encode('utf-8')).hexdigest()
+
+    @staticmethod
+    def compute_dedup_hash(raw_token: str, source_type: str = 'crm', filters: Optional[dict] = None) -> str:
+        """Produces a deterministic SHA-256 hash of token, source_type, and sorted filters."""
+        import json
+        normalized_filters = json.dumps(filters or {}, sort_keys=True, separators=(',', ':'))
+        payload = f"{raw_token.strip()}|{source_type.strip()}|{normalized_filters}"
+        return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
     @staticmethod
     def mask_token(raw_token: str) -> str:

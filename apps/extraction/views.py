@@ -1,14 +1,17 @@
 """API Views implementing Data Extraction Service endpoints."""
 import uuid
 import logging
-from django.db import connection
+from django.db import connection, transaction
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
 
+from django.conf import settings
 from apps.extraction.models import JobStatus
+from apps.common.permissions import HasServiceApiKey
+from apps.common.authentication import ApiKeyAuthentication
 from apps.extraction.serializers import (
     StartScanRequestSerializer,
     StartScanResponseSerializer,
@@ -51,6 +54,8 @@ def parse_uuid_or_404(raw_id: str) -> uuid.UUID:
 
 class StartScanView(APIView):
     """Initiates a new data extraction scan from the third-party service."""
+
+    permission_classes = [HasServiceApiKey]
 
     @extend_schema(
         tags=['Scan Operations'],
@@ -96,6 +101,12 @@ class StartScanView(APIView):
             strict_conflict=strict_dedup
         )
 
+        # Trigger background execution worker thread for production runtime after commit
+        if created and getattr(settings, 'EXTRACTION_ASYNC_EXECUTION', True):
+            transaction.on_commit(
+                lambda: ExtractionService.dispatch_background_extraction(job_id=job.id, api_token=api_token)
+            )
+
         response_data = {
             'job_id': job.id,
             'status': job.status,
@@ -111,6 +122,8 @@ class StartScanView(APIView):
 
 class ScanStatusView(APIView):
     """Queries the execution status and progress of a specific extraction job."""
+
+    permission_classes = [HasServiceApiKey]
 
     @extend_schema(
         tags=['Scan Operations'],
@@ -140,6 +153,7 @@ class ScanStatusView(APIView):
 class ScanResultView(APIView):
     """Fetches extracted data records for a completed extraction job with pagination."""
 
+    permission_classes = [HasServiceApiKey]
     pagination_class = StandardLimitOffsetPagination
 
     @extend_schema(
@@ -185,6 +199,8 @@ class ScanResultView(APIView):
 class ScanCancelView(APIView):
     """Cancels a pending or in-progress extraction job."""
 
+    permission_classes = [HasServiceApiKey]
+
     @extend_schema(
         tags=['Scan Operations'],
         summary='Cancel an active extraction job',
@@ -217,6 +233,8 @@ class ScanCancelView(APIView):
 class ScanRemoveView(APIView):
     """Permanently deletes an extraction job and all associated records."""
 
+    permission_classes = [HasServiceApiKey]
+
     @extend_schema(
         tags=['Scan Operations'],
         summary='Remove extraction job and stored records',
@@ -239,6 +257,7 @@ class ScanRemoveView(APIView):
 class JobListJobsView(APIView):
     """Lists all historical and active extraction jobs with filtering and pagination."""
 
+    permission_classes = [HasServiceApiKey]
     pagination_class = StandardLimitOffsetPagination
 
     @extend_schema(
@@ -276,6 +295,8 @@ class JobListJobsView(APIView):
 class JobStatisticsView(APIView):
     """Provides aggregated statistics across all historical and active extraction jobs."""
 
+    permission_classes = [HasServiceApiKey]
+
     @extend_schema(
         tags=['Job Analytics & Management'],
         summary='Get job statistics',
@@ -293,6 +314,8 @@ class JobStatisticsView(APIView):
 class JobAnalyticsView(APIView):
     """Provides analytics breakdown for dashboard reporting and data visualization."""
 
+    permission_classes = [HasServiceApiKey]
+
     @extend_schema(
         tags=['Job Analytics & Management'],
         summary='Get extraction analytics and source distribution',
@@ -309,6 +332,8 @@ class JobAnalyticsView(APIView):
 
 class HealthCheckView(APIView):
     """Operational health check confirming API and database connectivity."""
+
+    permission_classes = []
 
     @extend_schema(
         tags=['Health'],
