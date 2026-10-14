@@ -208,6 +208,7 @@ class ScanCancelView(APIView):
             'Cancels a pending or in-progress job. If the job is already completed or failed, '
             'returns HTTP 409 Conflict.'
         ),
+        request=None,
         parameters=[
             OpenApiParameter('job_id', str, OpenApiParameter.PATH, description='UUID of the extraction job')
         ],

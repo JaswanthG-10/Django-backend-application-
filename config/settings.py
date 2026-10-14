@@ -3,24 +3,35 @@
 Generated for GreenTree / Springer Capital backend development practical assignment.
 """
 from pathlib import Path
+from django.core.exceptions import ImproperlyConfigured
 from decouple import config, Csv
 import dj_database_url
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # Security Settings
-SECRET_KEY = config(
-    'SECRET_KEY',
-    default='XzD7ghJATyWXPRNq91FAE6Q1q3cZ1VCRRr-M-Sujtr5BcP4zWs_b_JgSuS6kxEe2'
-)
-
 DEBUG = config('DEBUG', default=True, cast=bool)
+
+# In development/test mode, fall back to a clearly designated dummy key if unset.
+# In production (DEBUG=False), require an explicit SECRET_KEY.
+_DEFAULT_DEV_SECRET = 'django-insecure-dev-fallback-key-for-local-testing-only-991823719238'
+SECRET_KEY = config('SECRET_KEY', default=_DEFAULT_DEV_SECRET if DEBUG else '')
+if not SECRET_KEY or (not DEBUG and SECRET_KEY == _DEFAULT_DEV_SECRET):
+    raise ImproperlyConfigured("SECRET_KEY environment variable must be set securely when running with DEBUG=False.")
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
-    default='localhost,127.0.0.1,0.0.0.0,testserver',
+    default='localhost,127.0.0.1,0.0.0.0,testserver' if DEBUG else '',
     cast=Csv()
 )
+
+CSRF_TRUSTED_ORIGINS = config(
+    'CSRF_TRUSTED_ORIGINS',
+    default='http://localhost:8000,http://127.0.0.1:8000',
+    cast=Csv()
+)
+
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 
 # Application definition
 INSTALLED_APPS = [
@@ -166,16 +177,34 @@ SPECTACULAR_SETTINGS = {
 }
 
 # API Key Security for API Callers
-API_KEY_SECRET = config('API_KEY_SECRET', default='cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28')
+# In development/test mode, fall back to a clearly designated dev key if unset.
+# In production (DEBUG=False), require an explicit API_KEY_SECRET.
+_DEFAULT_DEV_API_KEY = 'dev-local-api-key-secret-do-not-use-in-production'
+API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG else '')
+if not API_KEY_SECRET and not DEBUG:
+    raise ImproperlyConfigured("API_KEY_SECRET environment variable must be set when running with DEBUG=False.")
 
 # Asynchronous background execution (worker / thread runner)
 EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
+EXTRACTION_MAX_WORKERS = config('EXTRACTION_MAX_WORKERS', default=4, cast=int)
 
 # External Extraction Service Client Configuration
 # Defaults to jsonplaceholder.typicode.com as a live accessible data source, or any CRM URL
 EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://jsonplaceholder.typicode.com')
 EXTERNAL_API_TIMEOUT = config('EXTERNAL_API_TIMEOUT', default=10, cast=int)
 EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='test-sample-service-token')
+
+# Production Security Headers (active when DEBUG=False)
+if not DEBUG:
+    SECURE_BROWSER_XSS_FILTER = True
+    SECURE_CONTENT_TYPE_NOSNIFF = True
+    X_FRAME_OPTIONS = 'DENY'
+    SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=True, cast=bool)
+    CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=True, cast=bool)
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=False, cast=bool)
+    SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
+    SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
 
 # Logging Configuration
 LOG_LEVEL = config('LOG_LEVEL', default='INFO')

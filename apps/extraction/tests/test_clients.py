@@ -142,3 +142,23 @@ class TestThirdPartyExtractionClient:
         records = client.extract_data(api_token="valid-token", source_type="crm", page_size=20, max_pages=3)
         assert len(records) == 25
         assert mock_session.get.call_count == 2
+
+    def test_extract_data_omits_authorization_header_for_demo_endpoint(self):
+        """Security: Authorization tokens must not be sent to public demo/mock sandbox endpoints."""
+        demo_client = ThirdPartyExtractionClient(
+            base_url="https://jsonplaceholder.typicode.com",
+            timeout=5
+        )
+        mock_session = MagicMock()
+        mock_response = MagicMock(status_code=200)
+        mock_response.json.return_value = [
+            {"id": 1, "name": "Leanne Graham", "email": "sincere@april.biz"}
+        ]
+        mock_session.get.return_value = mock_response
+        demo_client.session = mock_session
+
+        records = demo_client.extract_data(api_token="sensitive-customer-secret-token", source_type="users")
+        assert len(records) == 1
+        call_args, call_kwargs = mock_session.get.call_args
+        assert call_args[0] == "https://jsonplaceholder.typicode.com/users"
+        assert "Authorization" not in call_kwargs["headers"]

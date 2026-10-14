@@ -222,11 +222,13 @@ All settings are configured using decoupled environment variables. See [.env.exa
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `SECRET_KEY` | `XzD7ghJATyWXPRNq91FAE6Q1q3cZ1VCRRr-M-Sujtr5BcP4zWs_b_JgSuS6kxEe2` | Django cryptographic secret key. |
+| `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. |
 | `DEBUG` | `True` | Boolean flag toggling Django debug mode. |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0` | Comma-separated list of allowed hostnames. |
-| `API_KEY_SECRET` | `cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28` | Service API key required for incoming API calls. |
-| `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker threads on scan start. |
+| `CSRF_TRUSTED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | Comma-separated list of trusted origins for CSRF. |
+| `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). |
+| `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker pool on scan start. |
+| `EXTRACTION_MAX_WORKERS` | `4` | Maximum concurrent worker threads in the bounded extraction pool. |
 | `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres). |
 | `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
 | `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
@@ -239,10 +241,12 @@ All settings are configured using decoupled environment variables. See [.env.exa
 
 All protected API endpoints require the caller to authenticate using the configured `API_KEY_SECRET`.
 
+Authentication is strictly **fail-closed**: if `API_KEY_SECRET` is unset, empty, or unconfigured on the server, all requests to protected endpoints are rejected with `401 Unauthorized`.
+
 Provide the API key via any of the following HTTP headers:
-* `X-API-KEY: cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
-* `Authorization: Api-Key cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
-* `Authorization: Bearer cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
+* `X-API-KEY: <your-api-key>`
+* `Authorization: Api-Key <your-api-key>`
+* `Authorization: Bearer <your-api-key>`
 
 Unauthenticated requests receive `401 Unauthorized`. The operational health check (`/api/v1/health`) and OpenAPI schema views (`/api/docs/`) remain public for monitoring and documentation.
 
@@ -253,8 +257,11 @@ Unauthenticated requests receive `401 Unauthorized`. The operational health chec
 When `/api/v1/scan/start` is called:
 1. The endpoint validates input, hashes the token and filters, and persists the job in state `pending`.
 2. It returns `202 Accepted` with the `job_id` immediately.
-3. Because `EXTRACTION_ASYNC_EXECUTION=True`, a background worker thread is dispatched after database commit (`transaction.on_commit`), transitioning the job to `in_progress`, extracting and paginating through records from the external provider, and updating the job to `completed`.
+3. Because `EXTRACTION_ASYNC_EXECUTION=True`, a task is submitted to a **managed bounded ThreadPoolExecutor** (configurable via `EXTRACTION_MAX_WORKERS`, default: 4) after database commit (`transaction.on_commit`). This avoids unbounded thread spawning, ensures graceful process teardown, transitions the job to `in_progress`, paginates through records, and marks the job `completed`.
 4. Subsequent calls to `/api/v1/scan/status/<job_id>` report progress and record count, and `/api/v1/scan/result/<job_id>` serves the extracted records.
+
+### Public Demo Endpoint Token Protection
+When `EXTERNAL_API_BASE_URL` points to public testing/sandbox endpoints (e.g., `jsonplaceholder.typicode.com`, `reqres.in`, `httpbin.org`), the HTTP client automatically omits the `Authorization` header to prevent leaking customer or service tokens across the public internet. For real CRM/custom endpoints, tokens are safely sent via `Authorization: Bearer <token>`.
 
 ### Standalone Polling Worker Command
 Alternatively, extractions can be processed using the dedicated Django management command:
@@ -342,14 +349,16 @@ The test suite is built strictly against the **[GreenTree Test Guidelines V1.md]
 pytest -v
 ```
 
-### Test Categories Covered (72 Automated Tests)
+### Test Categories Covered (76 Automated Tests)
 
-1. **API Authentication Tests:**
+1. **API Authentication & Fail-Closed Security Tests:**
    - Verifies missing API key returns `401 Unauthorized`.
    - Verifies invalid API key returns `401 Unauthorized`.
+   - Verifies strict fail-closed rejection when `API_KEY_SECRET` is unset/unconfigured.
    - Verifies public health check remains accessible without credentials.
-2. **Background Worker Execution Tests:**
-   - Tests end-to-end background thread extraction: triggering `/scan/start`, background processing, and retrieving completed records via `/scan/result/<job_id>`.
+2. **Background Worker & ThreadPoolExecutor Tests:**
+   - Tests end-to-end background extraction with bounded worker pool: triggering `/scan/start`, async execution, and retrieving completed records via `/scan/result/<job_id>`.
+   - Tests bounded `ThreadPoolExecutor` lifecycle, max worker concurrency, and graceful shutdown.
    - Tests `manage.py run_extraction_worker --once` polling execution.
 3. **Filter-Aware Deduplication Tests:**
    - Scans with different `filters` create distinct jobs.
@@ -360,6 +369,7 @@ pytest -v
    - Multi-page pagination traversal across pages.
    - Exponential backoff retries on HTTP 429 (respecting `Retry-After`) and 5xx server errors.
    - Token masking in logs.
+   - Token protection: verifying Authorization headers are omitted when calling public demo/mock endpoints.
 6. **Scan Workflow Integration Tests:**
    - Steps 1 through 8 from GreenTree test guidelines (`start` → `status` → `result` → `cancel` → `remove` → verify 404).
 7. **Edge Case Tests:**

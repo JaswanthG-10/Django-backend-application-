@@ -1,8 +1,11 @@
 """Permission classes for securing API endpoints."""
 import hmac
+import logging
 from django.conf import settings
 from rest_framework.permissions import BasePermission
 from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated
+
+logger = logging.getLogger('apps.common.permissions')
 
 
 class HasServiceApiKey(BasePermission):
@@ -11,9 +14,10 @@ class HasServiceApiKey(BasePermission):
     message = "Valid service API key is required to access this endpoint."
 
     def has_permission(self, request, view):
-        expected_key = getattr(settings, 'API_KEY_SECRET', '')
-        if not expected_key:
-            return True
+        expected_key = getattr(settings, 'API_KEY_SECRET', None)
+        if not expected_key or not str(expected_key).strip():
+            logger.error("API_KEY_SECRET is not configured on the server. Rejecting request (fail-closed).")
+            raise AuthenticationFailed("API key authentication is not configured on the server.")
 
         provided_key = None
         if 'HTTP_X_API_KEY' in request.META:

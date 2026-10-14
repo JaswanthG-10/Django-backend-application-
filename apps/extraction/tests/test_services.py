@@ -181,3 +181,22 @@ class TestExtractionService:
         assert seeded_pending_job.status == JobStatus.COMPLETED
         assert seeded_pending_job.record_count == 3
         assert "Successfully completed job" in out.getvalue()
+
+    def test_bounded_thread_pool_executor_lifecycle(self, settings):
+        """Worker Pool: Verifies bounded ThreadPoolExecutor lifecycle and shutdown."""
+        from apps.extraction.services import get_extraction_executor, shutdown_extraction_executor
+        import concurrent.futures
+
+        settings.EXTRACTION_MAX_WORKERS = 3
+        shutdown_extraction_executor(wait=True)
+
+        executor = get_extraction_executor()
+        assert isinstance(executor, concurrent.futures.ThreadPoolExecutor)
+        assert executor._max_workers == 3
+
+        # Submit a simple callable
+        future = executor.submit(lambda x: x * 2, 21)
+        assert future.result(timeout=2) == 42
+
+        # Clean shutdown
+        shutdown_extraction_executor(wait=True)

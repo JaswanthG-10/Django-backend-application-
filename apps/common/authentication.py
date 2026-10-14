@@ -1,8 +1,12 @@
 """API Key Authentication for service endpoints."""
 import hmac
+import logging
 from django.conf import settings
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
+from drf_spectacular.extensions import OpenApiAuthenticationExtension
+
+logger = logging.getLogger('apps.common.authentication')
 
 
 class ServiceApiKeyUser:
@@ -28,9 +32,10 @@ class ApiKeyAuthentication(BaseAuthentication):
         return 'ApiKey realm="api"'
 
     def authenticate(self, request):
-        expected_key = getattr(settings, 'API_KEY_SECRET', '')
-        if not expected_key:
-            return (ServiceApiKeyUser(), None)
+        expected_key = getattr(settings, 'API_KEY_SECRET', None)
+        if not expected_key or not str(expected_key).strip():
+            logger.error("API_KEY_SECRET is not configured on the server. Authentication failed (fail-closed).")
+            raise AuthenticationFailed("API key authentication is not configured on the server.")
 
         provided_key = None
         if 'HTTP_X_API_KEY' in request.META:
@@ -53,3 +58,21 @@ class ApiKeyAuthentication(BaseAuthentication):
             raise AuthenticationFailed("Invalid service API key.")
 
         return (ServiceApiKeyUser(), None)
+
+
+class ApiKeyAuthenticationScheme(OpenApiAuthenticationExtension):
+    """Registers ApiKeyAuthentication with drf-spectacular OpenAPI generator."""
+    target_class = 'apps.common.authentication.ApiKeyAuthentication'
+    name = 'ApiKeyAuth'
+
+    def get_security_definition(self, auto_schema):
+        return {
+            'type': 'apiKey',
+            'in': 'header',
+            'name': 'X-API-KEY',
+            'description': (
+                'Service API key passed via X-API-KEY header, '
+                'Authorization: Api-Key <key>, or Authorization: Bearer <key>'
+            ),
+        }
+

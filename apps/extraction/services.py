@@ -1,8 +1,11 @@
 """Business service layer for managing extraction job workflows."""
 import logging
 import threading
+import atexit
+from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
 from uuid import UUID
+from django.conf import settings
 from django.db import transaction, connection
 from django.utils import timezone
 from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
@@ -17,6 +20,36 @@ from apps.common.exceptions import (
 
 logger = logging.getLogger('apps.extraction.services')
 
+# Bounded thread pool executor for managed asynchronous execution in production
+_extraction_executor: Optional[ThreadPoolExecutor] = None
+_executor_lock = threading.Lock()
+
+
+def get_extraction_executor() -> ThreadPoolExecutor:
+    """Returns the managed, bounded ThreadPoolExecutor for background extraction tasks."""
+    global _extraction_executor
+    if _extraction_executor is None:
+        with _executor_lock:
+            if _extraction_executor is None:
+                max_workers = getattr(settings, 'EXTRACTION_MAX_WORKERS', 4)
+                _extraction_executor = ThreadPoolExecutor(
+                    max_workers=max_workers,
+                    thread_name_prefix="extraction-worker"
+                )
+                atexit.register(shutdown_extraction_executor)
+                logger.info("Initialized bounded extraction thread pool with max_workers=%d", max_workers)
+    return _extraction_executor
+
+
+def shutdown_extraction_executor(wait: bool = False) -> None:
+    """Gracefully shuts down the background extraction thread pool."""
+    global _extraction_executor
+    if _extraction_executor is not None:
+        with _executor_lock:
+            if _extraction_executor is not None:
+                _extraction_executor.shutdown(wait=wait, cancel_futures=True)
+                _extraction_executor = None
+
 
 class ExtractionService:
     """Orchestrates job lifecycle transitions, deduplication, and data extraction pipelines."""
@@ -26,10 +59,11 @@ class ExtractionService:
 
     @classmethod
     def dispatch_background_extraction(cls, job_id: UUID, api_token: str) -> None:
-        """Dispatches extraction to an asynchronous background worker thread.
+        """Dispatches extraction to a managed bounded thread pool worker.
         
         Guarantees that the job transitions through pending -> in_progress -> completed (or failed)
-        in real production execution without blocking the 202 Accepted HTTP response.
+        in real production execution without blocking the 202 Accepted HTTP response, while
+        preventing unbounded thread creation or sudden termination.
         """
         def _worker():
             try:
@@ -37,16 +71,15 @@ class ExtractionService:
                 service = cls()
                 service.process_extraction(job_id=job_id, api_token=api_token)
             except Exception as exc:
-                logger.warning("Background extraction task completed with status update for job %s: %s", job_id, exc)
+                logger.warning(
+                    "Background extraction task completed with status update for job %s: %s",
+                    job_id, exc
+                )
             finally:
                 connection.close()
 
-        worker_thread = threading.Thread(
-            target=_worker,
-            name=f"extraction-worker-{job_id}",
-            daemon=True
-        )
-        worker_thread.start()
+        executor = get_extraction_executor()
+        executor.submit(_worker)
 
     @transaction.atomic
     def initiate_job(

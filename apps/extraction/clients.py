@@ -43,7 +43,22 @@ class ThirdPartyExtractionClient:
         """Safely masks authorization tokens for structured logging."""
         if not token or len(token) <= 8:
             return '***'
-        return f"{token[:3]}***{token[-4:]}"
+    @staticmethod
+    def _is_public_demo_endpoint(url: str) -> bool:
+        """Determines if target URL belongs to a public demo/mock sandbox service.
+        
+        Prevents leaking confidential customer or service authorization tokens across
+        the public internet to unauthenticated third-party testing sandboxes.
+        """
+        lowered = url.lower()
+        public_demo_domains = (
+            'jsonplaceholder.typicode.com',
+            'reqres.in',
+            'httpbin.org',
+            'mocky.io',
+            'dummyjson.com',
+        )
+        return any(domain in lowered for domain in public_demo_domains)
 
     def _determine_url(self, source_type: str) -> str:
         """Determines target URL based on provider base URL and source type."""
@@ -161,10 +176,19 @@ class ThirdPartyExtractionClient:
 
         url = self._determine_url(source_type)
         headers = {
-            'Authorization': f"Bearer {api_token.strip()}",
             'Accept': 'application/json',
             'User-Agent': 'GreenTree-DataExtractionClient/1.0',
         }
+
+        # Prevent tokens from being sent to public demo/mock sandbox endpoints
+        if self._is_public_demo_endpoint(url):
+            logger.info(
+                "Target URL '%s' is a public demo/sandbox endpoint. "
+                "Omitted Authorization header to prevent token leakage.",
+                url
+            )
+        else:
+            headers['Authorization'] = f"Bearer {api_token.strip()}"
 
         masked = self._mask_token(api_token)
         logger.info(

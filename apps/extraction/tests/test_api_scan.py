@@ -19,36 +19,44 @@ class TestScanWorkflowApi:
 
     def test_start_scan_success(self, api_client):
         """Step 2: Start New Extraction (/api/v1/scan/start) with body."""
+        from unittest.mock import patch
+        from apps.extraction.services import ExtractionService
+
         url = reverse('extraction:scan-start')
         payload = {
             'api_token': 'test-secret-token-12345',
             'source_type': 'crm',
             'filters': {'created_after': '2026-01-01'}
         }
-        response = api_client.post(url, data=payload, format='json')
-        assert response.status_code == status.HTTP_202_ACCEPTED
-        data = response.json()
-        assert 'job_id' in data
-        assert data['status'] == 'pending'
-        assert data['is_existing'] is False
+        with patch.object(ExtractionService, 'dispatch_background_extraction') as mock_dispatch:
+            response = api_client.post(url, data=payload, format='json')
+            assert response.status_code == status.HTTP_202_ACCEPTED
+            data = response.json()
+            assert 'job_id' in data
+            assert data['status'] == 'pending'
+            assert data['is_existing'] is False
 
-        # Confirm persisted in DB
-        job = ExtractionJob.objects.get(id=data['job_id'])
-        assert job.status == JobStatus.PENDING
-        assert job.source_type == 'crm'
+            # Confirm persisted in DB
+            job = ExtractionJob.objects.get(id=data['job_id'])
+            assert job.status == JobStatus.PENDING
+            assert job.source_type == 'crm'
 
     def test_start_scan_with_header_token(self, api_client):
         """Step 2 variation: Start scan providing token via X-API-Token header."""
+        from unittest.mock import patch
+        from apps.extraction.services import ExtractionService
+
         url = reverse('extraction:scan-start')
-        response = api_client.post(
-            url,
-            data={'source_type': 'contacts'},
-            format='json',
-            HTTP_X_API_TOKEN='header-token-secret-999'
-        )
-        assert response.status_code == status.HTTP_202_ACCEPTED
-        data = response.json()
-        assert 'job_id' in data
+        with patch.object(ExtractionService, 'dispatch_background_extraction'):
+            response = api_client.post(
+                url,
+                data={'source_type': 'contacts'},
+                format='json',
+                HTTP_X_API_TOKEN='header-token-secret-999'
+            )
+            assert response.status_code == status.HTTP_202_ACCEPTED
+            data = response.json()
+            assert 'job_id' in data
 
     def test_get_job_status_pending(self, api_client, seeded_pending_job):
         """Step 2: Verify Job Status for pending state."""
@@ -204,38 +212,50 @@ class TestScanWorkflowApi:
 
     def test_filter_deduplication_via_api(self, api_client):
         """Deduplication: Different filters create distinct jobs; identical filters reuse active job."""
+        from unittest.mock import patch
+        from apps.extraction.services import ExtractionService
+
         url = reverse('extraction:scan-start')
 
-        # Request 1 with filter A
-        resp1 = api_client.post(
-            url,
-            data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
-            format='json'
-        )
-        assert resp1.status_code == status.HTTP_202_ACCEPTED
-        job_id_1 = resp1.json()['job_id']
-        assert resp1.json()['is_existing'] is False
+        with patch.object(ExtractionService, 'dispatch_background_extraction'):
+            # Request 1 with filter A
+            resp1 = api_client.post(
+                url,
+                data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
+                format='json'
+            )
+            assert resp1.status_code == status.HTTP_202_ACCEPTED
+            job_id_1 = resp1.json()['job_id']
+            assert resp1.json()['is_existing'] is False
 
-        # Request 2 with filter B (different)
-        resp2 = api_client.post(
-            url,
-            data={'api_token': 'filter-token-1', 'filters': {'segment': 'smb'}},
-            format='json'
-        )
-        assert resp2.status_code == status.HTTP_202_ACCEPTED
-        job_id_2 = resp2.json()['job_id']
-        assert resp2.json()['is_existing'] is False
-        assert job_id_1 != job_id_2
+            # Request 2 with filter B (different)
+            resp2 = api_client.post(
+                url,
+                data={'api_token': 'filter-token-1', 'filters': {'segment': 'smb'}},
+                format='json'
+            )
+            assert resp2.status_code == status.HTTP_202_ACCEPTED
+            job_id_2 = resp2.json()['job_id']
+            assert resp2.json()['is_existing'] is False
+            assert job_id_1 != job_id_2
 
-        # Request 3 with filter A (identical to Request 1)
-        resp3 = api_client.post(
-            url,
-            data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
-            format='json'
-        )
-        assert resp3.status_code == status.HTTP_202_ACCEPTED
-        assert resp3.json()['job_id'] == job_id_1
-        assert resp3.json()['is_existing'] is True
+            # Request 3 with filter A (identical to Request 1)
+            resp3 = api_client.post(
+                url,
+                data={'api_token': 'filter-token-1', 'filters': {'segment': 'enterprise'}},
+                format='json'
+            )
+            assert resp3.status_code == status.HTTP_202_ACCEPTED
+            assert resp3.json()['job_id'] == job_id_1
+            assert resp3.json()['is_existing'] is True
+
+    def test_fail_closed_when_api_key_secret_unset(self, api_client, settings):
+        """Security: API authentication must fail closed when API_KEY_SECRET is unset or empty."""
+        settings.API_KEY_SECRET = None
+        url = reverse('extraction:jobs-list')
+        response = api_client.get(url, HTTP_X_API_KEY='any-key')
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert 'not configured on the server' in response.json()['error']['message']
 
     def test_error_details_sanitized_in_status_response(self, api_client, seeded_failed_job):
         """Status API: Never leaks raw tracebacks or internal exceptions in error_details."""
