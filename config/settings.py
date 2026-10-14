@@ -11,10 +11,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Security Settings
 SECRET_KEY = config(
     'SECRET_KEY',
-    default='django-insecure-production-ready-evaluation-key-greentree-springer-capital'
+    default='XzD7ghJATyWXPRNq91FAE6Q1q3cZ1VCRRr-M-Sujtr5BcP4zWs_b_JgSuS6kxEe2'
 )
 
-DEBUG = config('DEBUG', default=False, cast=bool)
+DEBUG = config('DEBUG', default=True, cast=bool)
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
@@ -166,7 +166,7 @@ SPECTACULAR_SETTINGS = {
 }
 
 # API Key Security for API Callers
-API_KEY_SECRET = config('API_KEY_SECRET', default='greentree-default-service-key-2026')
+API_KEY_SECRET = config('API_KEY_SECRET', default='cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28')
 
 # Asynchronous background execution (worker / thread runner)
 EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
@@ -175,7 +175,7 @@ EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, 
 # Defaults to jsonplaceholder.typicode.com as a live accessible data source, or any CRM URL
 EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://jsonplaceholder.typicode.com')
 EXTERNAL_API_TIMEOUT = config('EXTERNAL_API_TIMEOUT', default=10, cast=int)
-EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='')
+EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='test-sample-service-token')
 
 # Logging Configuration
 LOG_LEVEL = config('LOG_LEVEL', default='INFO')

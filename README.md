@@ -222,14 +222,15 @@ All settings are configured using decoupled environment variables. See [.env.exa
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `SECRET_KEY` | *(django-insecure...)* | Django cryptographic secret key (change in production). |
-| `DEBUG` | `False` | Boolean flag toggling Django debug mode. |
-| `ALLOWED_HOSTS` | `localhost,127.0.0.1,testserver` | Comma-separated list of allowed hostnames. |
-| `API_KEY_SECRET` | `greentree-default-service-key-2026` | Service API key required for incoming API calls. |
+| `SECRET_KEY` | `XzD7ghJATyWXPRNq91FAE6Q1q3cZ1VCRRr-M-Sujtr5BcP4zWs_b_JgSuS6kxEe2` | Django cryptographic secret key. |
+| `DEBUG` | `True` | Boolean flag toggling Django debug mode. |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0` | Comma-separated list of allowed hostnames. |
+| `API_KEY_SECRET` | `cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28` | Service API key required for incoming API calls. |
 | `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker threads on scan start. |
 | `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres). |
 | `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
 | `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
+| `EXTERNAL_API_DEFAULT_TOKEN` | `test-sample-service-token` | Default token for example data source. |
 | `LOG_LEVEL` | `INFO` | Logging threshold level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
 ---
@@ -239,9 +240,9 @@ All settings are configured using decoupled environment variables. See [.env.exa
 All protected API endpoints require the caller to authenticate using the configured `API_KEY_SECRET`.
 
 Provide the API key via any of the following HTTP headers:
-* `X-API-KEY: greentree-default-service-key-2026`
-* `Authorization: Api-Key greentree-default-service-key-2026`
-* `Authorization: Bearer greentree-default-service-key-2026`
+* `X-API-KEY: cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
+* `Authorization: Api-Key cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
+* `Authorization: Bearer cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28`
 
 Unauthenticated requests receive `401 Unauthorized`. The operational health check (`/api/v1/health`) and OpenAPI schema views (`/api/docs/`) remain public for monitoring and documentation.
 

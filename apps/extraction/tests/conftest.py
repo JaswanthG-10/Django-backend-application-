@@ -24,7 +24,7 @@ def disable_async_extraction_for_unit_tests(settings):
 def api_client():
     """Provides a fresh DRF APIClient authenticated with the service API key."""
     client = APIClient()
-    key = getattr(settings, 'API_KEY_SECRET', 'greentree-default-service-key-2026')
+    key = getattr(settings, 'API_KEY_SECRET', 'cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28')
     client.credentials(HTTP_X_API_KEY=key)
     return client
 
