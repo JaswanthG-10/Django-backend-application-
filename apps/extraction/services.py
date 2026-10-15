@@ -67,7 +67,7 @@ class ExtractionService:
         """
         def _worker():
             try:
-                connection.close()
+                connection.close_if_unusable_or_obsolete()
                 service = cls()
                 service.process_extraction(job_id=job_id, api_token=api_token)
             except Exception as exc:
@@ -76,7 +76,7 @@ class ExtractionService:
                     job_id, exc
                 )
             finally:
-                connection.close()
+                connection.close_if_unusable_or_obsolete()
 
         executor = get_extraction_executor()
         executor.submit(_worker)
@@ -116,7 +116,7 @@ class ExtractionService:
                 logger.info("Found existing active extraction job %s for dedup_hash=%s", active_job.id, dedup_hash[:8])
                 return active_job, False
 
-        job = ExtractionJob.objects.create(
+        job = ExtractionJob(
             source_type=source_type,
             token_hash=token_hash,
             dedup_hash=dedup_hash,
@@ -124,8 +124,70 @@ class ExtractionService:
             status=JobStatus.PENDING,
             metadata=metadata or {}
         )
+        job.set_encrypted_token(api_token)
+        job.save()
         logger.info("Created new extraction job %s (status=pending, source=%s)", job.id, source_type)
         return job, True
+
+    @classmethod
+    def claim_next_pending_job(cls) -> Optional[ExtractionJob]:
+        """Atomically claims the next pending extraction job without race conditions.
+        
+        Uses conditional update to guarantee that across multiple concurrent worker processes,
+        each job is claimed exclusively by exactly one worker.
+        """
+        candidate = ExtractionJob.objects.filter(
+            status=JobStatus.PENDING
+        ).order_by('created_at').values_list('id', flat=True).first()
+
+        if not candidate:
+            return None
+
+        now = timezone.now()
+        rows_updated = ExtractionJob.objects.filter(
+            id=candidate,
+            status=JobStatus.PENDING
+        ).update(
+            status=JobStatus.IN_PROGRESS,
+            start_time=now,
+            updated_at=now
+        )
+
+        if rows_updated == 1:
+            job = ExtractionJob.objects.get(id=candidate)
+            logger.info("Worker atomically claimed job %s", job.id)
+            return job
+        return None
+
+    @classmethod
+    def recover_stale_jobs(cls, timeout_minutes: Optional[int] = None) -> int:
+        """Identifies and marks stale/abandoned in_progress jobs as failed.
+        
+        Handles worker crashes or abrupt terminations where jobs were left in in_progress state.
+        """
+        minutes = timeout_minutes or getattr(settings, 'EXTRACTION_JOB_TIMEOUT_MINUTES', 15)
+        threshold = timezone.now() - timezone.timedelta(minutes=minutes)
+        stale_jobs = list(ExtractionJob.objects.filter(
+            status=JobStatus.IN_PROGRESS,
+            start_time__lt=threshold
+        ))
+        recovered_count = 0
+        for job in stale_jobs:
+            logger.warning("Recovering stale abandoned extraction job %s (started %s)", job.id, job.start_time)
+            try:
+                job.transition_to(
+                    JobStatus.FAILED,
+                    error_message=f"Job execution timed out after exceeding {minutes} minutes threshold.",
+                    error_details={
+                        'code': 'WORKER_ABANDONED_TIMEOUT',
+                        'category': 'worker_failure',
+                        'threshold_minutes': minutes
+                    }
+                )
+                recovered_count += 1
+            except Exception as exc:
+                logger.error("Failed to recover stale job %s: %s", job.id, exc)
+        return recovered_count
 
     @transaction.atomic
     def cancel_job(self, job_id: UUID) -> ExtractionJob:
@@ -176,7 +238,7 @@ class ExtractionService:
     def process_extraction(
         self,
         job_id: UUID,
-        api_token: str,
+        api_token: Optional[str] = None,
         mock_records: Optional[list] = None
     ) -> ExtractionJob:
         """Executes the extraction pipeline for a job.
@@ -188,8 +250,23 @@ class ExtractionService:
         if not job:
             raise ResourceNotFoundError(f"Job with ID '{job_id}' not found.")
 
-        # Mark in progress
-        job.transition_to(JobStatus.IN_PROGRESS)
+        # Resolve API token: either explicitly passed or decrypted from secure storage
+        active_token = api_token or job.get_decrypted_token()
+        if not active_token and mock_records is None:
+            job.transition_to(
+                JobStatus.FAILED,
+                error_message="Authentication failed: No valid API token available for extraction.",
+                error_details={'code': 'MISSING_CREDENTIALS', 'category': 'auth_error'}
+            )
+            from apps.common.exceptions import ExternalServiceAuthError
+            raise ExternalServiceAuthError("No valid external API token available for extraction job.")
+
+        # Mark in progress if pending
+        if job.status == JobStatus.PENDING:
+            job.transition_to(JobStatus.IN_PROGRESS)
+        elif job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
+            logger.warning("Attempted to process extraction on terminal job %s (status=%s)", job.id, job.status)
+            return job
 
         try:
             if mock_records is not None:
@@ -197,10 +274,19 @@ class ExtractionService:
             else:
                 filters = job.metadata.get('filters', {})
                 records_data = self.client.extract_data(
-                    api_token=api_token,
+                    api_token=active_token,
                     source_type=job.source_type,
                     filters=filters
                 )
+
+            # Check if job was cancelled while external network request was executing
+            job.refresh_from_db()
+            if job.status == JobStatus.CANCELLED:
+                logger.info(
+                    "Extraction job %s was cancelled during external extraction; skipping record persistence.",
+                    job.id
+                )
+                return job
 
             # Persist extracted records using bulk_create
             record_objects = []
@@ -224,14 +310,22 @@ class ExtractionService:
                 )
 
             with transaction.atomic():
+                job.refresh_from_db()
+                if job.status == JobStatus.CANCELLED:
+                    logger.info("Extraction job %s was cancelled during atomic commit; aborting completion.", job.id)
+                    return job
+
                 if record_objects:
                     ExtractedRecord.objects.bulk_create(record_objects, ignore_conflicts=True)
+
+                # Accurately reflect actual persisted count in database
+                actual_persisted_count = ExtractedRecord.objects.filter(job=job).count()
                 job.transition_to(
                     JobStatus.COMPLETED,
-                    record_count=len(record_objects)
+                    record_count=actual_persisted_count
                 )
 
-            logger.info("Extraction job %s completed successfully with %d records.", job.id, len(record_objects))
+            logger.info("Extraction job %s completed successfully with %d records.", job.id, actual_persisted_count)
             return job
 
         except BaseDomainException as exc:
@@ -243,22 +337,26 @@ class ExtractionService:
             }
             if isinstance(exc.details, dict) and 'status_code' in exc.details:
                 safe_details['status_code'] = exc.details['status_code']
-            job.transition_to(
-                JobStatus.FAILED,
-                error_message=exc.message,
-                error_details=safe_details
-            )
+            job.refresh_from_db()
+            if job.status != JobStatus.CANCELLED:
+                job.transition_to(
+                    JobStatus.FAILED,
+                    error_message=exc.message,
+                    error_details=safe_details
+                )
             raise
 
         except Exception as exc:
             logger.exception("Unexpected error during extraction for job %s: %s", job.id, str(exc))
             # Never leak raw str(exc), tracebacks, or internal database errors to client status
-            job.transition_to(
-                JobStatus.FAILED,
-                error_message="Unexpected internal error during data extraction.",
-                error_details={
-                    'code': 'INTERNAL_EXTRACTION_FAILURE',
-                    'category': 'internal_server_error'
-                }
-            )
+            job.refresh_from_db()
+            if job.status != JobStatus.CANCELLED:
+                job.transition_to(
+                    JobStatus.FAILED,
+                    error_message="Unexpected internal error during data extraction.",
+                    error_details={
+                        'code': 'INTERNAL_EXTRACTION_FAILURE',
+                        'category': 'internal_server_error'
+                    }
+                )
             raise

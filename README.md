@@ -32,15 +32,17 @@ The **Data Extraction Service** facilitates ingestion and extraction of entity r
 
 Key capabilities:
 1. **Asynchronous Scan Initiation (`/api/v1/scan/start`)**: Accepts extraction requests with token hashing and filter-aware deduplication, immediately returning `202 Accepted` while dispatching background extraction.
-2. **Background Execution Pipeline**: Automatically runs extractions in a background worker thread upon trigger, or via the `run_extraction_worker` polling management command.
-3. **Multi-Page External Client with Retries**: Paginates through external endpoints, with automatic exponential backoff retries on HTTP 429 (Too Many Requests) and 5xx server errors, respecting `Retry-After` headers.
-4. **API Key Authentication**: Protects all mutation and retrieval endpoints using constant-time comparison against `API_KEY_SECRET` (`X-API-KEY` or `Authorization: Api-Key <key>`).
-5. **Status Polling & Progress Tracking (`/api/v1/scan/status/<job_id>`)**: Real-time lifecycle monitoring (`pending`, `in_progress`, `completed`, `failed`, `cancelled`) with sanitized error details that never leak internal tracebacks.
-6. **Paginated Data Retrieval (`/api/v1/scan/result/<job_id>`)**: Enforces state validation (rejects incomplete jobs with `409 Conflict`), returning paginated entity records.
-7. **Controlled Cancellation (`/api/v1/scan/cancel/<job_id>`)**: Enforces strict state machine rules (prevents cancelling completed or failed jobs).
-8. **Data Cleanup & Purge (`/api/v1/scan/remove/<job_id>`)**: Atomic cascade deletion of extraction jobs and records.
-9. **Aggregated Analytics & Reporting (`/api/v1/jobs/statistics`, `/api/v1/jobs/analytics`)**: Single-query database aggregations for operational insights.
-10. **Production Health Check (`/api/v1/health`)**: Public liveness and readiness probe with database connection verification.
+2. **Field-Level Token Encryption & Transient Lifecycle**: Stores external API tokens encrypted at rest via AES-Fernet (`FIELD_ENCRYPTION_KEY`), strictly isolating caller credentials (`X-API-KEY`) from external CRM tokens. Encrypted tokens are decrypted in-memory only during extraction and automatically scrubbed upon reaching terminal states (`COMPLETED`, `CANCELLED`, `FAILED`).
+3. **Background Execution Pipeline & Concurrency**: Automatically runs extractions via a managed bounded thread pool or dedicated multi-worker processes using atomic conditional database claims (`claim_next_pending_job`) to prevent duplicate processing.
+4. **Stale Job Recovery**: Automatically detects and transitions abandoned or stalled worker jobs older than `EXTRACTION_JOB_TIMEOUT_MINUTES` to `FAILED` with diagnostic code `WORKER_ABANDONED_TIMEOUT`.
+5. **Multi-Page External Client with Retries**: Paginates through external endpoints, with automatic exponential backoff retries on HTTP 429 (Too Many Requests) and 5xx server errors, respecting `Retry-After` headers.
+6. **API Key Authentication**: Protects all mutation and retrieval endpoints using constant-time comparison against `API_KEY_SECRET` (`X-API-KEY` or `Authorization: Api-Key <key>`). Fails closed if unconfigured.
+7. **Status Polling & Progress Tracking (`/api/v1/scan/status/<job_id>`)**: Real-time lifecycle monitoring (`pending`, `in_progress`, `completed`, `failed`, `cancelled`) with sanitized error details that never leak internal tracebacks.
+8. **Paginated Data Retrieval (`/api/v1/scan/result/<job_id>`)**: Enforces state validation (rejects incomplete jobs with `409 Conflict`), returning paginated entity records.
+9. **Controlled Cancellation (`/api/v1/scan/cancel/<job_id>`)**: Enforces strict state machine rules (prevents cancelling completed or failed jobs).
+10. **Data Cleanup & Purge (`/api/v1/scan/remove/<job_id>`)**: Atomic cascade deletion of extraction jobs and records.
+11. **Aggregated Analytics & Reporting (`/api/v1/jobs/statistics`, `/api/v1/jobs/analytics`)**: Single-query database aggregations for operational insights.
+12. **Operational Health Probes (`/api/v1/health`, `/health/liveness`, `/health/readiness`)**: Consolidated and standalone Kubernetes-ready health, liveness, and readiness probes.
 
 ---
 
@@ -224,11 +226,13 @@ All settings are configured using decoupled environment variables. See [.env.exa
 | :--- | :--- | :--- |
 | `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. |
 | `DEBUG` | `True` | Boolean flag toggling Django debug mode. |
-| `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0` | Comma-separated list of allowed hostnames. |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,testserver` | Comma-separated list of allowed hostnames. |
 | `CSRF_TRUSTED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | Comma-separated list of trusted origins for CSRF. |
 | `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). |
+| `FIELD_ENCRYPTION_KEY` | *(Derived from SECRET_KEY if dev)* | 32-byte urlsafe base64 Fernet key for encrypting tokens at rest. Generate via: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. |
 | `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker pool on scan start. |
 | `EXTRACTION_MAX_WORKERS` | `4` | Maximum concurrent worker threads in the bounded extraction pool. |
+| `EXTRACTION_JOB_TIMEOUT_MINUTES` | `15` | Minutes before an abandoned in-progress job is marked timed out / failed. |
 | `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres). |
 | `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
 | `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
@@ -264,13 +268,16 @@ When `/api/v1/scan/start` is called:
 When `EXTERNAL_API_BASE_URL` points to public testing/sandbox endpoints (e.g., `jsonplaceholder.typicode.com`, `reqres.in`, `httpbin.org`), the HTTP client automatically omits the `Authorization` header to prevent leaking customer or service tokens across the public internet. For real CRM/custom endpoints, tokens are safely sent via `Authorization: Bearer <token>`.
 
 ### Standalone Polling Worker Command
-Alternatively, extractions can be processed using the dedicated Django management command:
+Alternatively, in multi-container or distributed environments, background execution can be handed off entirely to dedicated worker processes (`EXTRACTION_ASYNC_EXECUTION=False` on web nodes):
+* **Atomic Job Claiming (`claim_next_pending_job`)**: Workers use atomic conditional database updates (`status='pending' -> status='in_progress'`), guaranteeing that multiple concurrent worker processes will never double-process or collide on the same job.
+* **Stale Job Recovery (`--recover-stale`)**: Recovers jobs stranded in `in_progress` due to crashed worker nodes or network partitions, transitioning them to `failed` with code `WORKER_ABANDONED_TIMEOUT`.
+
 ```bash
-# Continuous polling loop (every 2 seconds)
-python manage.py run_extraction_worker --poll-interval 2.0
+# Continuous polling loop (every 2 seconds) with stale job recovery enabled
+python manage.py run_extraction_worker --poll-interval 2.0 --recover-stale
 
 # Run one pass and exit
-python manage.py run_extraction_worker --once
+python manage.py run_extraction_worker --once --recover-stale
 ```
 
 ---
@@ -323,7 +330,9 @@ Interactive OpenAPI 3.0 documentation is auto-generated via `drf-spectacular` wi
 | `GET` | `/api/v1/jobs/jobs` | Lists historical extraction jobs with filters & pagination | `200 OK`, `401` |
 | `GET` | `/api/v1/jobs/statistics` | Returns aggregated metrics across all jobs | `200 OK`, `401` |
 | `GET` | `/api/v1/jobs/analytics` | Provides analytics breakdown for charts & dashboard | `200 OK`, `401` |
-| `GET` | `/api/v1/health` | Operational health check (verifies database connection) | `200 OK`, `503` (Public) |
+| `GET` | `/api/v1/health` | Consolidated operational health probe (status & subsystem checks) | `200 OK`, `503` (Public) |
+| `GET` | `/api/v1/health/liveness` | Container liveness check (200 OK when process is running) | `200 OK` (Public) |
+| `GET` | `/api/v1/health/readiness` | Container readiness check (200 OK / 503 Service Unavailable) | `200 OK`, `503` (Public) |
 
 ### Standard Error Envelope
 
@@ -349,46 +358,62 @@ The test suite is built strictly against the **[GreenTree Test Guidelines V1.md]
 pytest -v
 ```
 
-### Test Categories Covered (76 Automated Tests)
+### Test Categories Covered (89 Automated Tests)
 
 1. **API Authentication & Fail-Closed Security Tests:**
    - Verifies missing API key returns `401 Unauthorized`.
    - Verifies invalid API key returns `401 Unauthorized`.
    - Verifies strict fail-closed rejection when `API_KEY_SECRET` is unset/unconfigured.
    - Verifies public health check remains accessible without credentials.
-2. **Background Worker & ThreadPoolExecutor Tests:**
+   - Verifies separation between service caller credentials (`X-API-KEY`) and external data provider credentials (`api_token` / `X-API-Token`).
+2. **Field-Level Encryption & Token Scrubbing Lifecycle:**
+   - External tokens are symmetrically encrypted at rest via AES-Fernet (`FIELD_ENCRYPTION_KEY`).
+   - Verifies external tokens are never stored plaintext in the database or exposed via API serializers.
+   - Verifies encrypted tokens are automatically purged upon reaching terminal states (`COMPLETED`, `CANCELLED`, `FAILED`).
+   - Comprehensive token masking tests: tokens `<= 8` characters masked to `***`, longer tokens masked to `tok***1234`.
+3. **Worker Concurrency & Reliability Tests:**
+   - Multi-worker atomic job claiming (`claim_next_pending_job`) verified with concurrent racing transactions.
+   - Automated stale job recovery: orphaned `in_progress` jobs older than timeout are transitioned to `failed`.
+   - Mid-flight cancellation safety: jobs cancelled during network polling abort cleanly without overwriting state.
+   - Accurate database record counting: `record_count` reflects actual rows committed in `ExtractedRecord`.
+4. **Health & Diagnostic Probe Tests:**
+   - Dedicated tests for `/api/v1/health`, `/api/v1/health/liveness`, and `/api/v1/health/readiness`.
+   - Simulates database disconnection returning `503 Service Unavailable`.
+5. **Background Worker & ThreadPoolExecutor Tests:**
    - Tests end-to-end background extraction with bounded worker pool: triggering `/scan/start`, async execution, and retrieving completed records via `/scan/result/<job_id>`.
    - Tests bounded `ThreadPoolExecutor` lifecycle, max worker concurrency, and graceful shutdown.
    - Tests `manage.py run_extraction_worker --once` polling execution.
-3. **Filter-Aware Deduplication Tests:**
+6. **Filter-Aware Deduplication Tests:**
    - Scans with different `filters` create distinct jobs.
    - Scans with identical `filters` (even with reordered JSON keys) reuse the existing active job.
-4. **Error Sanitization Tests:**
+7. **Error Sanitization Tests:**
    - Failed jobs store clean diagnostic codes in `error_details` without leaking internal Python exceptions, database passwords, or filesystem tracebacks.
-5. **Third-Party Client Unit Tests:**
+8. **Third-Party Client Unit Tests:**
    - Multi-page pagination traversal across pages.
    - Exponential backoff retries on HTTP 429 (respecting `Retry-After`) and 5xx server errors.
    - Token masking in logs.
    - Token protection: verifying Authorization headers are omitted when calling public demo/mock endpoints.
-6. **Scan Workflow Integration Tests:**
+9. **Scan Workflow Integration Tests:**
    - Steps 1 through 8 from GreenTree test guidelines (`start` → `status` → `result` → `cancel` → `remove` → verify 404).
-7. **Edge Case Tests:**
-   - Missing, empty, whitespace-only, or short API tokens (`400 Bad Request`).
-   - Malformed JSON payloads (`400 Bad Request`).
-   - Non-existent UUIDs and SQL injection / non-standard ID attempts (`404 Not Found`).
-   - Accessing results on incomplete or failed jobs (`409 Conflict` with `JOB_NOT_COMPLETED`).
-   - Cancelling already completed, failed, or cancelled jobs (`409 Conflict`).
-   - Concurrent duplicate scans with `strict_deduplication=True` (`409 Conflict`).
-   - Extreme pagination bounds (oversized limit bounded to 100, out-of-range offset).
-8. **N+1 Query Performance Tests:**
-   - Query count assertions using `django_assert_num_queries` ensuring result listing and job listing maintain constant query counts regardless of dataset volume.
+10. **Edge Case Tests:**
+    - Missing, empty, whitespace-only, or short API tokens (`400 Bad Request`).
+    - Malformed JSON payloads (`400 Bad Request`).
+    - Non-existent UUIDs and SQL injection / non-standard ID attempts (`404 Not Found`).
+    - Accessing results on incomplete or failed jobs (`409 Conflict` with `JOB_NOT_COMPLETED`).
+    - Cancelling already completed, failed, or cancelled jobs (`409 Conflict`).
+    - Concurrent duplicate scans with `strict_deduplication=True` (`409 Conflict`).
+    - Extreme pagination bounds (oversized limit bounded to 100, out-of-range offset).
+11. **N+1 Query Performance Tests:**
+    - Query count assertions using `django_assert_num_queries` ensuring result listing and job listing maintain constant query counts regardless of dataset volume.
 
 ---
 
 ## Security & Compliance
 
-- **Caller Authentication:** Mandatory API Key (`X-API-KEY`) validated with constant-time comparison.
-- **No Secret Persistence:** The raw third-party API token is never stored in plaintext in the database. A deterministic SHA-256 hash (`token_hash`) is indexed for deduplication, and a masked representation (e.g. `pat***1234`) is kept for audit visibility.
+- **Caller Authentication:** Mandatory API Key (`X-API-KEY` or `Authorization: Api-Key <key>`) validated with constant-time comparison (`secrets.compare_digest`). Fails closed if missing or unconfigured.
+- **External Credential Isolation:** The caller's service key (`X-API-KEY`) is strictly isolated from third-party CRM tokens (`api_token` in request body or `X-API-Token` header).
+- **Encrypted Token at Rest:** Third-party provider tokens are stored in the database exclusively as AES-Fernet encrypted ciphertext, decrypted in-memory only during active extraction, and purged immediately on terminal status.
+- **No Plaintext Secret Persistence:** The raw API token is never stored in plaintext in the database or exposed via serialized API responses. A deterministic SHA-256 hash (`token_hash`) is indexed for deduplication, and a masked representation (`tok***1234` or `***`) is kept for audit visibility.
 - **Traceback & Error Sanitization:** In production, unhandled errors and failed extraction jobs return sanitized JSON diagnostics without exposing Python stack traces, internal paths, or framework internals.
 - **Input Sanitization:** URL parameters and payload fields undergo strict validation and UUID parsing before reaching the ORM.
 

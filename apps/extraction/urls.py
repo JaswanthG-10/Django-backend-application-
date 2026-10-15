@@ -10,6 +10,8 @@ from apps.extraction.views import (
     JobStatisticsView,
     JobAnalyticsView,
     HealthCheckView,
+    LivenessHealthCheckView,
+    ReadinessHealthCheckView,
 )
 
 app_name = 'extraction'
@@ -27,6 +29,8 @@ urlpatterns = [
     path('jobs/statistics', JobStatisticsView.as_view(), name='jobs-statistics'),
     path('jobs/analytics', JobAnalyticsView.as_view(), name='jobs-analytics'),
 
-    # Operational Health Endpoint
+    # Operational Health Endpoints
     path('health', HealthCheckView.as_view(), name='health-check'),
+    path('health/liveness', LivenessHealthCheckView.as_view(), name='health-liveness'),
+    path('health/readiness', ReadinessHealthCheckView.as_view(), name='health-readiness'),
 ]

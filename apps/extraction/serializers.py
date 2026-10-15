@@ -140,3 +140,5 @@ class HealthResponseSerializer(serializers.Serializer):
     database = serializers.CharField()
     timestamp = serializers.CharField()
     version = serializers.CharField()
+    checks = serializers.DictField(required=False)
+

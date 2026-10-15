@@ -66,6 +66,9 @@ class StartScanView(APIView):
             'or 409 Conflict if strict deduplication is requested.'
         ),
         request=StartScanRequestSerializer,
+        parameters=[
+            OpenApiParameter('X-API-Token', str, OpenApiParameter.HEADER, description='External provider API token (if not provided in body)'),
+        ],
         responses={
             202: OpenApiResponse(response=StartScanResponseSerializer, description='Job accepted and scheduled'),
             400: OpenApiResponse(description='Validation error or missing token'),
@@ -73,15 +76,16 @@ class StartScanView(APIView):
         }
     )
     def post(self, request, *args, **kwargs):
-        # Allow token from Authorization header or X-API-Token if not provided in body
+        # External provider token is retrieved strictly from request body or dedicated X-API-Token header.
+        # The Authorization header is strictly reserved for caller service authentication (ApiKeyAuthentication).
         data = request.data.copy() if hasattr(request.data, 'copy') else dict(request.data)
         if not data.get('api_token'):
-            auth_header = request.headers.get('X-API-Token') or request.headers.get('Authorization')
-            if auth_header:
-                if auth_header.startswith('Bearer '):
-                    data['api_token'] = auth_header[7:].strip()
+            ext_token_header = request.headers.get('X-API-Token') or request.META.get('HTTP_X_API_TOKEN')
+            if ext_token_header:
+                if ext_token_header.startswith('Bearer '):
+                    data['api_token'] = ext_token_header[7:].strip()
                 else:
-                    data['api_token'] = auth_header.strip()
+                    data['api_token'] = ext_token_header.strip()
 
         serializer = StartScanRequestSerializer(data=data)
         serializer.is_valid(raise_exception=True)
@@ -358,10 +362,69 @@ class HealthCheckView(APIView):
             db_status = "unhealthy"
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
+        liveness_status = "ok"
+        readiness_status = "ok" if db_status == "healthy" else "degraded"
         payload = {
             'status': 'ok' if db_status == 'healthy' else 'degraded',
             'database': db_status,
             'timestamp': timezone.now().isoformat(),
-            'version': '1.0.0'
+            'version': '1.0.0',
+            'checks': {
+                'liveness': liveness_status,
+                'readiness': readiness_status,
+                'database': db_status
+            }
         }
         return Response(HealthResponseSerializer(payload).data, status=status_code)
+
+
+class LivenessHealthCheckView(APIView):
+    """Kubernetes/container liveness probe confirming Django process is running."""
+    permission_classes = []
+
+    @extend_schema(
+        tags=['Health'],
+        summary='Liveness probe',
+        description='Returns 200 OK if the Django application process is alive.',
+        responses={200: OpenApiResponse(description='Service process alive')}
+    )
+    def get(self, request, *args, **kwargs):
+        return Response({
+            'status': 'ok',
+            'probe': 'liveness',
+            'timestamp': timezone.now().isoformat()
+        }, status=status.HTTP_200_OK)
+
+
+class ReadinessHealthCheckView(APIView):
+    """Kubernetes/container readiness probe confirming database and dependencies are ready."""
+    permission_classes = []
+
+    @extend_schema(
+        tags=['Health'],
+        summary='Readiness probe',
+        description='Returns 200 OK if database connectivity is available to serve requests.',
+        responses={
+            200: OpenApiResponse(description='Service ready to serve traffic'),
+            503: OpenApiResponse(description='Service degraded / database unreachable')
+        }
+    )
+    def get(self, request, *args, **kwargs):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+            return Response({
+                'status': 'ok',
+                'probe': 'readiness',
+                'database': 'healthy',
+                'timestamp': timezone.now().isoformat()
+            }, status=status.HTTP_200_OK)
+        except Exception as exc:
+            logger.error("Readiness probe database check failed: %s", exc)
+            return Response({
+                'status': 'degraded',
+                'probe': 'readiness',
+                'database': 'unhealthy',
+                'timestamp': timezone.now().isoformat()
+            }, status=status.HTTP_503_SERVICE_UNAVAILABLE)

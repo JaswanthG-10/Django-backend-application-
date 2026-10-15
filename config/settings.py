@@ -84,12 +84,30 @@ WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
 # Database Configuration
-DATABASE_URL = config('DATABASE_URL', default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}")
+_DEFAULT_SQLITE_URL = f"sqlite:///{BASE_DIR / 'db.sqlite3'}"
+DATABASE_URL = config('DATABASE_URL', default=_DEFAULT_SQLITE_URL if DEBUG else '')
+if not DATABASE_URL and not DEBUG:
+    raise ImproperlyConfigured("DATABASE_URL environment variable must be set securely when running with DEBUG=False.")
+if not DEBUG and DATABASE_URL.startswith('sqlite'):
+    raise ImproperlyConfigured("SQLite is not permitted in production (DEBUG=False). Please configure a PostgreSQL DATABASE_URL.")
+
+_is_postgres = not DATABASE_URL.startswith('sqlite')
+_is_local_db = any(h in DATABASE_URL for h in ('localhost', '127.0.0.1', 'testserver'))
+_ssl_require = config('DB_SSL_REQUIRE', default=(_is_postgres and not _is_local_db), cast=bool)
+_is_pooler = 'pooler.supabase.com' in DATABASE_URL or ':6543' in DATABASE_URL
+_conn_max_age = config('DB_CONN_MAX_AGE', default=(0 if _is_pooler or DATABASE_URL.startswith('sqlite') else 600), cast=int)
+_disable_server_side_cursors = config('DB_DISABLE_SERVER_SIDE_CURSORS', default=_is_pooler, cast=bool)
+
+_db_config = dj_database_url.parse(
+    DATABASE_URL,
+    conn_max_age=_conn_max_age,
+    ssl_require=_ssl_require,
+)
+if _disable_server_side_cursors:
+    _db_config['DISABLE_SERVER_SIDE_CURSORS'] = True
+
 DATABASES = {
-    'default': dj_database_url.parse(
-        DATABASE_URL,
-        conn_max_age=600 if not DATABASE_URL.startswith('sqlite') else 0,
-    )
+    'default': _db_config
 }
 
 # Password validation
@@ -184,9 +202,23 @@ API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG 
 if not API_KEY_SECRET and not DEBUG:
     raise ImproperlyConfigured("API_KEY_SECRET environment variable must be set when running with DEBUG=False.")
 
+# Field-Level Symmetric Encryption Key for sensitive tokens at rest (Fernet key)
+# If unset in development/test mode, deterministically derived from SECRET_KEY.
+# In production (DEBUG=False), require an explicit valid 32-byte Fernet key.
+FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY', default=None)
+if not FIELD_ENCRYPTION_KEY and not DEBUG:
+    raise ImproperlyConfigured("FIELD_ENCRYPTION_KEY environment variable must be set securely when running with DEBUG=False.")
+if FIELD_ENCRYPTION_KEY:
+    try:
+        from cryptography.fernet import Fernet
+        Fernet(FIELD_ENCRYPTION_KEY.encode('utf-8') if isinstance(FIELD_ENCRYPTION_KEY, str) else FIELD_ENCRYPTION_KEY)
+    except Exception as exc:
+        raise ImproperlyConfigured("Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte Fernet key.") from exc
+
 # Asynchronous background execution (worker / thread runner)
 EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
 EXTRACTION_MAX_WORKERS = config('EXTRACTION_MAX_WORKERS', default=4, cast=int)
+EXTRACTION_JOB_TIMEOUT_MINUTES = config('EXTRACTION_JOB_TIMEOUT_MINUTES', default=15, cast=int)
 
 # External Extraction Service Client Configuration
 # Defaults to jsonplaceholder.typicode.com as a live accessible data source, or any CRM URL

@@ -14,6 +14,7 @@ class ExtractionJobFactory(factory.django.DjangoModelFactory):
     token_hash = factory.LazyAttribute(lambda o: ExtractionJob.hash_token("test-secret-api-token"))
     dedup_hash = factory.LazyAttribute(lambda o: ExtractionJob.compute_dedup_hash("test-secret-api-token", o.source_type, getattr(o, 'metadata', {}).get('filters') if hasattr(o, 'metadata') else {}))
     masked_token = "tes***oken"
+    encrypted_token = factory.LazyAttribute(lambda o: ExtractionJob.encrypt_token("test-secret-api-token"))
     status = JobStatus.PENDING
     record_count = 0
     start_time = None

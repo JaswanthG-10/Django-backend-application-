@@ -64,6 +64,11 @@ class ExtractionJob(models.Model):
         default='',
         help_text="Masked token representation for auditing, e.g. 'pat-***1234'."
     )
+    encrypted_token = models.TextField(
+        blank=True,
+        default='',
+        help_text="Securely encrypted external provider API token for background worker extraction."
+    )
     status = models.CharField(
         max_length=32,
         choices=JobStatus.choices,
@@ -140,10 +145,39 @@ class ExtractionJob(models.Model):
     @staticmethod
     def mask_token(raw_token: str) -> str:
         """Masks an API token for safe storage and logging."""
+        if not raw_token:
+            return '***'
         token = raw_token.strip()
         if len(token) <= 8:
             return '***'
         return f"{token[:3]}***{token[-4:]}"
+
+    @classmethod
+    def encrypt_token(cls, raw_token: str) -> str:
+        """Encrypts a token string using Fernet field encryption."""
+        from apps.common.encryption import encrypt_secret
+        return encrypt_secret(raw_token) if raw_token else ''
+
+    def set_encrypted_token(self, raw_token: str) -> None:
+        """Encrypts and sets the external provider token using Fernet symmetric encryption."""
+        if raw_token and raw_token.strip():
+            self.encrypted_token = self.encrypt_token(raw_token.strip())
+        else:
+            self.encrypted_token = ''
+
+    def get_decrypted_token(self) -> Optional[str]:
+        """Decrypts and returns the stored external provider token, or None if empty or invalid."""
+        from apps.common.encryption import decrypt_secret
+        if not self.encrypted_token:
+            return None
+        try:
+            return decrypt_secret(self.encrypted_token)
+        except Exception:
+            return None
+
+    def clear_encrypted_token(self) -> None:
+        """Purges sensitive encrypted credential upon reaching a terminal lifecycle state."""
+        self.encrypted_token = ''
 
     @property
     def is_terminal(self) -> bool:
@@ -192,10 +226,17 @@ class ExtractionJob(models.Model):
             )
 
         now = timezone.now()
+        update_fields = [
+            'status', 'start_time', 'end_time', 'error_message',
+            'error_details', 'record_count', 'updated_at'
+        ]
+
         if target_status == JobStatus.IN_PROGRESS and not self.start_time:
             self.start_time = now
         elif target_status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
             self.end_time = now
+            self.clear_encrypted_token()
+            update_fields.append('encrypted_token')
 
         self.status = target_status
 
@@ -206,10 +247,7 @@ class ExtractionJob(models.Model):
         if record_count is not None:
             self.record_count = record_count
 
-        self.save(update_fields=[
-            'status', 'start_time', 'end_time', 'error_message',
-            'error_details', 'record_count', 'updated_at'
-        ])
+        self.save(update_fields=update_fields)
 
 
 class ExtractedRecord(models.Model):

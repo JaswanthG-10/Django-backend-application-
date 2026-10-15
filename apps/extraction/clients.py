@@ -33,7 +33,10 @@ class ThirdPartyExtractionClient:
         max_retries: int = 3,
         session: Optional[requests.Session] = None
     ):
-        self.base_url = (base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', 'https://jsonplaceholder.typicode.com')).rstrip('/')
+        raw_base_url = (base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', 'https://jsonplaceholder.typicode.com')).rstrip('/')
+        if not getattr(settings, 'DEBUG', True) and raw_base_url.lower().startswith('http://'):
+            raise ExternalServiceError("External provider base URL must use HTTPS in production.")
+        self.base_url = raw_base_url
         self.timeout = timeout or getattr(settings, 'EXTERNAL_API_TIMEOUT', 10)
         self.max_retries = max_retries
         self.session = session or requests.Session()
@@ -41,8 +44,13 @@ class ThirdPartyExtractionClient:
     @staticmethod
     def _mask_token(token: str) -> str:
         """Safely masks authorization tokens for structured logging."""
-        if not token or len(token) <= 8:
+        if not token:
             return '***'
+        cleaned = token.strip()
+        if len(cleaned) <= 8:
+            return '***'
+        return f"{cleaned[:3]}***{cleaned[-4:]}"
+
     @staticmethod
     def _is_public_demo_endpoint(url: str) -> bool:
         """Determines if target URL belongs to a public demo/mock sandbox service.

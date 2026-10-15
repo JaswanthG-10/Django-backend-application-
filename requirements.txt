@@ -7,6 +7,7 @@ dj-database-url>=3.0.0
 requests>=2.31.0
 psycopg2-binary>=2.9.9
 gunicorn>=22.0.0
+cryptography>=42.0.0
 
 # Testing and Development
 pytest>=8.0.0
