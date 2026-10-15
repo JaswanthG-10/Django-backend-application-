@@ -14,6 +14,9 @@ class HasServiceApiKey(BasePermission):
     message = "Valid service API key is required to access this endpoint."
 
     def has_permission(self, request, view):
+        if request.user and getattr(request.user, 'is_authenticated', False):
+            return True
+
         expected_key = getattr(settings, 'API_KEY_SECRET', None)
         if not expected_key or not str(expected_key).strip():
             logger.error("API_KEY_SECRET is not configured on the server. Rejecting request (fail-closed).")

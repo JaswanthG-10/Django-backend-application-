@@ -62,14 +62,22 @@ class ExtractionService:
         """Dispatches extraction to a managed bounded thread pool worker.
         
         Guarantees that the job transitions through pending -> in_progress -> completed (or failed)
-        in real production execution without blocking the 202 Accepted HTTP response, while
-        preventing unbounded thread creation or sudden termination.
+        in real production execution without blocking the 202 Accepted HTTP response.
+        Both inline thread workers and standalone background worker processes must
+        claim the job atomically before processing.
         """
         def _worker():
             try:
                 connection.close_if_unusable_or_obsolete()
                 service = cls()
-                service.process_extraction(job_id=job_id, api_token=api_token)
+                # Unified atomic claiming in the thread worker path:
+                claimed = service.claim_job(job_id=job_id)
+                if not claimed:
+                    logger.info("Background thread skipped job %s (already claimed or cancelled).", job_id)
+                    return
+                # Retrieve token from parameter or decrypted storage
+                token = api_token or claimed.get_decrypted_token()
+                service.process_extraction(job_id=job_id, api_token=token, already_claimed=True)
             except Exception as exc:
                 logger.warning(
                     "Background extraction task completed with status update for job %s: %s",
@@ -95,6 +103,9 @@ class ExtractionService:
         Deduplication checks token_hash + source_type + normalized filters. If filters differ,
         a new distinct job is created.
         """
+        # Automatically run background stale job recovery
+        self.recover_stale_jobs()
+
         filters = (metadata or {}).get('filters', {})
         dedup_hash = ExtractionJob.compute_dedup_hash(
             raw_token=api_token,
@@ -130,12 +141,30 @@ class ExtractionService:
         return job, True
 
     @classmethod
-    def claim_next_pending_job(cls) -> Optional[ExtractionJob]:
-        """Atomically claims the next pending extraction job without race conditions.
+    def claim_job(cls, job_id: Optional[UUID] = None) -> Optional[ExtractionJob]:
+        """Atomically claims a specific or next pending extraction job without race conditions.
         
-        Uses conditional update to guarantee that across multiple concurrent worker processes,
-        each job is claimed exclusively by exactly one worker.
+        Uses conditional update (status=PENDING -> IN_PROGRESS) to guarantee that across both
+        inline thread workers and standalone worker processes, each job is claimed exclusively
+        by exactly one worker.
         """
+        now = timezone.now()
+        if job_id is not None:
+            rows_updated = ExtractionJob.objects.filter(
+                id=job_id,
+                status=JobStatus.PENDING
+            ).update(
+                status=JobStatus.IN_PROGRESS,
+                start_time=now,
+                updated_at=now
+            )
+            if rows_updated == 1:
+                job = ExtractionJob.objects.get(id=job_id)
+                logger.info("Worker atomically claimed specific job %s", job.id)
+                return job
+            return None
+
+        # Next pending job ordered by created_at
         candidate = ExtractionJob.objects.filter(
             status=JobStatus.PENDING
         ).order_by('created_at').values_list('id', flat=True).first()
@@ -143,7 +172,6 @@ class ExtractionService:
         if not candidate:
             return None
 
-        now = timezone.now()
         rows_updated = ExtractionJob.objects.filter(
             id=candidate,
             status=JobStatus.PENDING
@@ -155,17 +183,27 @@ class ExtractionService:
 
         if rows_updated == 1:
             job = ExtractionJob.objects.get(id=candidate)
-            logger.info("Worker atomically claimed job %s", job.id)
+            logger.info("Worker atomically claimed next job %s", job.id)
             return job
         return None
 
     @classmethod
-    def recover_stale_jobs(cls, timeout_minutes: Optional[int] = None) -> int:
-        """Identifies and marks stale/abandoned in_progress jobs as failed.
+    def claim_next_pending_job(cls) -> Optional[ExtractionJob]:
+        """Convenience method for worker loops."""
+        return cls.claim_job()
+
+    @classmethod
+    def recover_stale_jobs(cls, timeout_minutes: Optional[int] = None, allow_retry: bool = True) -> int:
+        """Identifies and recovers stale/abandoned in_progress jobs automatically.
         
-        Handles worker crashes or abrupt terminations where jobs were left in in_progress state.
+        Decides whether interrupted jobs can safely be retried or should permanently fail:
+        - If the job has valid encrypted credentials and retry_count < max_retries,
+          it cleans up any partial records for idempotency and resets the job to PENDING.
+        - If max retries have been reached or credentials cannot be recovered,
+          it permanently transitions the job to FAILED.
         """
         minutes = timeout_minutes or getattr(settings, 'EXTRACTION_JOB_TIMEOUT_MINUTES', 15)
+        max_retries_setting = getattr(settings, 'EXTRACTION_MAX_RETRIES', 3)
         threshold = timezone.now() - timezone.timedelta(minutes=minutes)
         stale_jobs = list(ExtractionJob.objects.filter(
             status=JobStatus.IN_PROGRESS,
@@ -173,18 +211,49 @@ class ExtractionService:
         ))
         recovered_count = 0
         for job in stale_jobs:
-            logger.warning("Recovering stale abandoned extraction job %s (started %s)", job.id, job.start_time)
+            logger.warning(
+                "Recovering stale abandoned extraction job %s (started %s, retry %d/%d)",
+                job.id, job.start_time, job.retry_count, job.max_retries or max_retries_setting
+            )
             try:
-                job.transition_to(
-                    JobStatus.FAILED,
-                    error_message=f"Job execution timed out after exceeding {minutes} minutes threshold.",
-                    error_details={
-                        'code': 'WORKER_ABANDONED_TIMEOUT',
-                        'category': 'worker_failure',
-                        'threshold_minutes': minutes
+                can_retry = allow_retry and (job.retry_count < (job.max_retries or max_retries_setting)) and bool(job.encrypted_token)
+
+                if can_retry:
+                    # Clean up partial records from interrupted run to guarantee idempotent retry
+                    ExtractedRecord.objects.filter(job=job).delete()
+                    job.record_count = 0
+                    job.retry_count += 1
+                    job.status = JobStatus.PENDING
+                    job.start_time = None
+                    job.end_time = None
+                    job.error_message = f"Job was interrupted and automatically recovered for retry attempt {job.retry_count}."
+                    job.error_details = {
+                        'code': 'AUTOMATIC_RECOVERY_RETRY',
+                        'retry_count': job.retry_count,
+                        'max_retries': job.max_retries or max_retries_setting,
+                        'recovered_at': timezone.now().isoformat()
                     }
-                )
-                recovered_count += 1
+                    job.save(update_fields=[
+                        'status', 'retry_count', 'record_count',
+                        'start_time', 'end_time', 'error_message', 'error_details', 'updated_at'
+                    ])
+                    logger.info("Stale job %s safely recovered and re-queued to PENDING (retry %d)", job.id, job.retry_count)
+                    recovered_count += 1
+                else:
+                    reason = "Max retries exceeded" if job.retry_count >= (job.max_retries or max_retries_setting) else "Missing recovery credentials"
+                    code = 'MAX_RETRIES_EXCEEDED' if 'Max' in reason else 'WORKER_ABANDONED_TIMEOUT'
+                    job.transition_to(
+                        JobStatus.FAILED,
+                        error_message=f"Job timed out and was abandoned after {minutes} minutes ({reason}).",
+                        error_details={
+                            'code': code,
+                            'category': 'worker_failure',
+                            'retry_count': job.retry_count,
+                            'reason': reason,
+                            'threshold_minutes': minutes
+                        }
+                    )
+                    recovered_count += 1
             except Exception as exc:
                 logger.error("Failed to recover stale job %s: %s", job.id, exc)
         return recovered_count
@@ -239,16 +308,29 @@ class ExtractionService:
         self,
         job_id: UUID,
         api_token: Optional[str] = None,
-        mock_records: Optional[list] = None
+        mock_records: Optional[list] = None,
+        already_claimed: bool = False
     ) -> ExtractionJob:
         """Executes the extraction pipeline for a job.
         
         Fetches records from external provider, saves them in batch, and updates job status.
         Never stores raw tracebacks or internal exception text into error_details.
+        Both execution paths must claim the job atomically before processing.
         """
-        job = get_job_by_id(job_id)
-        if not job:
-            raise ResourceNotFoundError(f"Job with ID '{job_id}' not found.")
+        if not already_claimed:
+            claimed_job = self.claim_job(job_id=job_id)
+            if not claimed_job:
+                # If could not claim, check if it was cancelled or already in progress
+                job = get_job_by_id(job_id)
+                if not job:
+                    raise ResourceNotFoundError(f"Job with ID '{job_id}' not found.")
+                logger.info("Job %s was not claimed (status=%s). Returning.", job.id, job.status)
+                return job
+            job = claimed_job
+        else:
+            job = get_job_by_id(job_id)
+            if not job:
+                raise ResourceNotFoundError(f"Job with ID '{job_id}' not found.")
 
         # Resolve API token: either explicitly passed or decrypted from secure storage
         active_token = api_token or job.get_decrypted_token()

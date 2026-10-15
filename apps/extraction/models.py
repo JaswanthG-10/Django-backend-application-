@@ -80,6 +80,14 @@ class ExtractionJob(models.Model):
         default=0,
         help_text="Total number of records successfully extracted."
     )
+    retry_count = models.PositiveIntegerField(
+        default=0,
+        help_text="Number of automatic recovery retries attempted."
+    )
+    max_retries = models.PositiveIntegerField(
+        default=3,
+        help_text="Maximum recovery retries allowed before job is permanently marked failed."
+    )
     start_time = models.DateTimeField(
         null=True,
         blank=True,

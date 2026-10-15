@@ -69,12 +69,22 @@ class ThirdPartyExtractionClient:
         return any(domain in lowered for domain in public_demo_domains)
 
     def _determine_url(self, source_type: str) -> str:
-        """Determines target URL based on provider base URL and source type."""
-        # Check if base_url is a known public provider like jsonplaceholder
+        """Determines target URL based on configured provider endpoint template."""
+        template = getattr(settings, 'EXTERNAL_API_ENDPOINT_TEMPLATE', None)
+        if template:
+            return template.format(base_url=self.base_url, source_type=source_type)
+
+        # HubSpot CRM object endpoints
+        if 'hubapi' in self.base_url.lower():
+            endpoint_name = 'contacts' if source_type in ('crm', 'contacts') else source_type
+            return f"{self.base_url}/crm/v3/objects/{endpoint_name}"
+
+        # JSONPlaceholder public testing mock
         if 'jsonplaceholder' in self.base_url.lower():
             if source_type in ('crm', 'contacts', 'users'):
                 return f"{self.base_url}/users"
             return f"{self.base_url}/{source_type}"
+
         # Standard CRM API pattern
         return f"{self.base_url}/{source_type}/records"
 
@@ -177,7 +187,8 @@ class ThirdPartyExtractionClient:
     ) -> List[Dict[str, Any]]:
         """Fetches and pages through records from external provider endpoint.
         
-        Supports pagination across pages, exponential backoff retries, and data normalization.
+        Supports configurable provider endpoints, cursor/offset/page pagination,
+        exponential backoff retries, and data normalization.
         """
         if not api_token or not api_token.strip():
             raise ExternalServiceAuthError("API token must not be empty.")
@@ -206,16 +217,30 @@ class ThirdPartyExtractionClient:
 
         all_records: List[Dict[str, Any]] = []
         seen_ids = set()
+        next_cursor = None
+        next_url = url
+        pagination_type = getattr(settings, 'EXTERNAL_API_PAGINATION_TYPE', 'auto').lower()
 
         for page in range(1, max_pages + 1):
             page_params = dict(filters or {})
-            # Include standard pagination query parameters
-            page_params['page'] = page
-            page_params['limit'] = page_size
-            page_params['_page'] = page
-            page_params['_limit'] = page_size
+            current_req_url = next_url or url
 
-            response = self._execute_request_with_retries(url, headers, page_params)
+            # Apply pagination parameters according to configured or detected pagination style
+            if pagination_type == 'cursor' or (pagination_type == 'auto' and next_cursor):
+                cursor_param = getattr(settings, 'EXTERNAL_API_CURSOR_PARAM', 'after')
+                page_params[cursor_param] = next_cursor
+                page_params['limit'] = page_size
+            elif pagination_type == 'offset_limit':
+                page_params['offset'] = (page - 1) * page_size
+                page_params['limit'] = page_size
+            else:
+                # Default page-number pagination
+                page_params['page'] = page
+                page_params['limit'] = page_size
+                page_params['_page'] = page
+                page_params['_limit'] = page_size
+
+            response = self._execute_request_with_retries(current_req_url, headers, page_params)
             status_code = response.status_code
 
             if status_code in (401, 403):
@@ -262,9 +287,18 @@ class ThirdPartyExtractionClient:
                     details={'reason': 'Malformed JSON'}
                 ) from exc
 
-            # Normalize container structure
-            if isinstance(payload, dict):
-                page_items = payload.get('data') or payload.get('results') or payload.get('records') or []
+            # Extract records from response payload
+            configured_key = getattr(settings, 'EXTERNAL_API_RECORDS_KEY', None)
+            if configured_key and isinstance(payload, dict) and configured_key in payload:
+                page_items = payload[configured_key]
+            elif isinstance(payload, dict):
+                page_items = (
+                    payload.get('results') or
+                    payload.get('data') or
+                    payload.get('records') or
+                    payload.get('items') or
+                    []
+                )
             elif isinstance(payload, list):
                 page_items = payload
             else:
@@ -288,8 +322,36 @@ class ThirdPartyExtractionClient:
                     all_records.append(norm)
                     new_in_page += 1
 
-            # If fewer than page_size items returned, or no new records found, end pagination
-            if len(page_items) < page_size or new_in_page == 0:
+            # Detect cursor or next page link for subsequent requests
+            next_cursor = None
+            if isinstance(payload, dict):
+                # HubSpot style: {"paging": {"next": {"after": "..."}}}
+                paging = payload.get('paging')
+                if isinstance(paging, dict):
+                    next_obj = paging.get('next')
+                    if isinstance(next_obj, dict):
+                        next_cursor = next_obj.get('after')
+                # Generic cursor style: {"next_cursor": "..."} or {"cursor": "..."}
+                if not next_cursor:
+                    next_cursor = payload.get('next_cursor') or payload.get('cursor')
+
+                # Next URL style (RFC 5988 / REST next link)
+                links = getattr(response, 'links', None)
+                link_next = links.get('next', {}).get('url') if isinstance(links, dict) else None
+                next_url = payload.get('next') if isinstance(payload.get('next'), str) else link_next
+
+            # If cursor pagination is active and no next cursor was found, terminate
+            if pagination_type == 'cursor' and not next_cursor:
+                break
+
+            # If no new records were extracted on this page, stop to prevent infinite loops
+            if new_in_page == 0:
+                break
+
+            # If explicit next cursor or next link is available, continue to next page;
+            # otherwise, terminate if fewer than page_size items were returned.
+            has_explicit_next = bool(next_cursor) or bool(next_url and next_url != current_req_url)
+            if not has_explicit_next and len(page_items) < page_size:
                 break
 
         logger.info("Successfully fetched %d records across pages from external provider.", len(all_records))

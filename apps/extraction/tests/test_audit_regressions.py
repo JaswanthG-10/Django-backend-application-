@@ -1,10 +1,16 @@
 """Regression tests verifying audit fixes and stability requirements."""
+import hashlib
+import hmac
+import json
+import time
 import pytest
 from unittest.mock import MagicMock, patch
 from io import StringIO
+from django.conf import settings
 from django.urls import reverse
 from django.utils import timezone
 from django.core.management import call_command
+from django.test import override_settings
 from rest_framework import status
 
 from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
@@ -266,3 +272,205 @@ class TestHealthProbesAndDiagnostics:
         assert 'checks' in data
         assert data['checks']['liveness'] == 'ok'
         assert data['checks']['readiness'] == 'ok'
+
+
+@pytest.mark.django_db
+class TestUnifiedClaimingAndStaleRetryDecision:
+    def test_unified_claiming_both_paths_atomic(self):
+        """Unified Claiming: Both inline thread and standalone worker must atomically claim job."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-unified-claim",
+            dedup_hash="dedup-unified-claim",
+            status=JobStatus.PENDING
+        )
+        job.set_encrypted_token("test-unified-token")
+        job.save()
+
+        # Worker 1 claims specific job (inline path)
+        claimed_1 = ExtractionService.claim_job(job_id=job.id)
+        assert claimed_1 is not None
+        assert claimed_1.status == JobStatus.IN_PROGRESS
+
+        # Worker 2 attempts to claim same job concurrently (standalone worker path)
+        claimed_2 = ExtractionService.claim_job(job_id=job.id)
+        assert claimed_2 is None
+
+        # Next pending claim returns None since job is already claimed
+        claimed_next = ExtractionService.claim_next_pending_job()
+        assert claimed_next is None
+
+    def test_stale_job_safe_retry_requeues_and_increments_retry_count(self):
+        """Recovery: Interrupted in-progress job under max retries is safely re-queued to PENDING."""
+        stale_time = timezone.now() - timezone.timedelta(minutes=30)
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-retry-test",
+            dedup_hash="dedup-retry-test",
+            status=JobStatus.IN_PROGRESS,
+            start_time=stale_time,
+            retry_count=0,
+            max_retries=3,
+            record_count=5
+        )
+        job.set_encrypted_token("test-retry-token")
+        job.save()
+
+        # Add dummy partial records from interrupted attempt
+        ExtractedRecord.objects.create(
+            job=job,
+            id_from_service="partial_1",
+            first_name="Partial",
+            last_name="Record"
+        )
+        assert ExtractedRecord.objects.filter(job=job).count() == 1
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15, allow_retry=True)
+        assert recovered == 1
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+        assert job.retry_count == 1
+        assert job.start_time is None
+        assert job.record_count == 0
+        assert ExtractedRecord.objects.filter(job=job).count() == 0
+        assert 'AUTOMATIC_RECOVERY_RETRY' in str(job.error_details)
+
+    def test_stale_job_max_retries_exceeded_fails_permanently(self):
+        """Recovery: Stale job exceeding max retries is permanently failed."""
+        stale_time = timezone.now() - timezone.timedelta(minutes=30)
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-max-retry",
+            dedup_hash="dedup-max-retry",
+            status=JobStatus.IN_PROGRESS,
+            start_time=stale_time,
+            retry_count=3,
+            max_retries=3
+        )
+        job.set_encrypted_token("test-token")
+        job.save()
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15, allow_retry=True)
+        assert recovered == 1
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.FAILED
+        assert job.error_details.get('code') == 'MAX_RETRIES_EXCEEDED'
+
+
+class TestConfigurableDataSourceAndPagination:
+    @patch('requests.Session.get')
+    def test_hubspot_cursor_based_pagination(self, mock_get):
+        """Configurable Provider: Traverses cursor-based pagination (HubSpot style)."""
+        resp_page1 = MagicMock()
+        resp_page1.status_code = 200
+        resp_page1.json.return_value = {
+            'results': [
+                {'id': 'hb_1', 'properties': {'email': 'hb1@example.com', 'firstname': 'Alice'}},
+                {'id': 'hb_2', 'properties': {'email': 'hb2@example.com', 'firstname': 'Bob'}},
+            ],
+            'paging': {'next': {'after': 'cursor_page_2'}}
+        }
+
+        resp_page2 = MagicMock()
+        resp_page2.status_code = 200
+        resp_page2.json.return_value = {
+            'results': [
+                {'id': 'hb_3', 'properties': {'email': 'hb3@example.com', 'firstname': 'Charlie'}},
+            ],
+            'paging': {}
+        }
+
+        mock_get.side_effect = [resp_page1, resp_page2]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="hubspot-pat-test-token", source_type="contacts")
+
+        assert len(records) == 3
+        assert mock_get.call_count == 2
+        # Check that page 2 passed after=cursor_page_2
+        assert mock_get.call_args_list[1][1]['params']['after'] == 'cursor_page_2'
+
+    @patch('requests.Session.get')
+    def test_configurable_endpoint_template(self, mock_get):
+        """Configurable Provider: Formats custom endpoint template."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = [{'id': 'custom_1', 'email': 'c@test.com'}]
+        mock_get.return_value = mock_resp
+
+        with override_settings(
+            EXTERNAL_API_BASE_URL="https://crm.myenterprise.com/v2",
+            EXTERNAL_API_ENDPOINT_TEMPLATE="{base_url}/data-export/{source_type}/all"
+        ):
+            client = ThirdPartyExtractionClient()
+            client.extract_data(api_token="test-enterprise-token", source_type="leads")
+
+            call_url = mock_get.call_args[0][0]
+            assert call_url == "https://crm.myenterprise.com/v2/data-export/leads/all"
+
+
+@pytest.mark.django_db
+class TestStrengthenedAuthenticationAndRequestSigning:
+    def test_request_signing_valid_signature_accepted(self, unauthenticated_client):
+        """Security: Valid HMAC-SHA256 request signature authenticates caller."""
+        url = reverse('extraction:scan-start')
+        timestamp = str(int(time.time()))
+        payload = {'source_type': 'crm', 'api_token': 'secret-crm-token-998877'}
+        body_bytes = json.dumps(payload).encode('utf-8')
+        body_hash = hashlib.sha256(body_bytes).hexdigest()
+
+        signing_secret = settings.API_KEY_SECRET
+        canonical = f"{timestamp}.POST.{url}.{body_hash}"
+        signature = hmac.new(signing_secret.encode('utf-8'), canonical.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        response = unauthenticated_client.post(
+            url,
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_X_SIGNATURE=signature,
+            HTTP_X_TIMESTAMP=timestamp
+        )
+        assert response.status_code == status.HTTP_202_ACCEPTED
+
+    def test_request_signing_tampered_body_rejected(self, unauthenticated_client):
+        """Security: Tampered payload with mismatched signature is rejected with 401."""
+        url = reverse('extraction:scan-start')
+        timestamp = str(int(time.time()))
+        original_payload = {'source_type': 'crm', 'api_token': 'original-token-112233'}
+        tampered_payload = {'source_type': 'crm', 'api_token': 'tampered-token-445566'}
+
+        body_hash = hashlib.sha256(json.dumps(original_payload).encode('utf-8')).hexdigest()
+        canonical = f"{timestamp}.POST.{url}.{body_hash}"
+        signature = hmac.new(settings.API_KEY_SECRET.encode('utf-8'), canonical.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        response = unauthenticated_client.post(
+            url,
+            data=json.dumps(tampered_payload),
+            content_type='application/json',
+            HTTP_X_SIGNATURE=signature,
+            HTTP_X_TIMESTAMP=timestamp
+        )
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert 'Invalid request signature' in response.json()['error']['message']
+
+    def test_request_signing_expired_timestamp_rejected(self, unauthenticated_client):
+        """Security: Expired timestamp outside tolerance window is rejected."""
+        url = reverse('extraction:scan-start')
+        expired_timestamp = str(int(time.time()) - 600)  # 10 minutes ago
+        payload = {'source_type': 'crm', 'api_token': 'test-token-123456'}
+        body_hash = hashlib.sha256(json.dumps(payload).encode('utf-8')).hexdigest()
+
+        canonical = f"{expired_timestamp}.POST.{url}.{body_hash}"
+        signature = hmac.new(settings.API_KEY_SECRET.encode('utf-8'), canonical.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        response = unauthenticated_client.post(
+            url,
+            data=json.dumps(payload),
+            content_type='application/json',
+            HTTP_X_SIGNATURE=signature,
+            HTTP_X_TIMESTAMP=expired_timestamp
+        )
+        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+        assert 'expired' in response.json()['error']['message'].lower()

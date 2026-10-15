@@ -196,11 +196,27 @@ SPECTACULAR_SETTINGS = {
 
 # API Key Security for API Callers
 # In development/test mode, fall back to a clearly designated dev key if unset.
-# In production (DEBUG=False), require an explicit API_KEY_SECRET.
+# In production (DEBUG=False), require an explicit unique API_KEY_SECRET.
 _DEFAULT_DEV_API_KEY = 'dev-local-api-key-secret-do-not-use-in-production'
+_PROHIBITED_PROD_API_KEYS = {
+    _DEFAULT_DEV_API_KEY,
+    'dev-testing-service-api-key-381923',
+    'test-api-key',
+    'test-secret-key',
+    'replace-with-a-secure-random-api-key-in-production',
+    'cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28',
+}
 API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG else '')
-if not API_KEY_SECRET and not DEBUG:
-    raise ImproperlyConfigured("API_KEY_SECRET environment variable must be set when running with DEBUG=False.")
+if not DEBUG:
+    if not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_KEYS:
+        raise ImproperlyConfigured(
+            "A unique, production-grade API_KEY_SECRET must be configured when running with DEBUG=False. "
+            "Shared development credentials and placeholder keys are strictly prohibited in production."
+        )
+
+# Request Signing Security (HMAC-SHA256 Payload & Timestamp Verification)
+API_REQUIRE_REQUEST_SIGNING = config('API_REQUIRE_REQUEST_SIGNING', default=False, cast=bool)
+API_SIGNING_TOLERANCE_SECONDS = config('API_SIGNING_TOLERANCE_SECONDS', default=300, cast=int)
 
 # Field-Level Symmetric Encryption Key for sensitive tokens at rest (Fernet key)
 # If unset in development/test mode, deterministically derived from SECRET_KEY.
@@ -219,12 +235,16 @@ if FIELD_ENCRYPTION_KEY:
 EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
 EXTRACTION_MAX_WORKERS = config('EXTRACTION_MAX_WORKERS', default=4, cast=int)
 EXTRACTION_JOB_TIMEOUT_MINUTES = config('EXTRACTION_JOB_TIMEOUT_MINUTES', default=15, cast=int)
+EXTRACTION_MAX_RETRIES = config('EXTRACTION_MAX_RETRIES', default=3, cast=int)
 
 # External Extraction Service Client Configuration
-# Defaults to jsonplaceholder.typicode.com as a live accessible data source, or any CRM URL
+# Allows pointing to real CRM / third-party API providers (e.g. HubSpot, Salesforce, custom CRM, JSONPlaceholder)
 EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://jsonplaceholder.typicode.com')
 EXTERNAL_API_TIMEOUT = config('EXTERNAL_API_TIMEOUT', default=10, cast=int)
 EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='test-sample-service-token')
+EXTERNAL_API_PAGINATION_TYPE = config('EXTERNAL_API_PAGINATION_TYPE', default='auto')  # auto, cursor, page_number, offset_limit
+EXTERNAL_API_ENDPOINT_TEMPLATE = config('EXTERNAL_API_ENDPOINT_TEMPLATE', default='')
+EXTERNAL_API_RECORDS_KEY = config('EXTERNAL_API_RECORDS_KEY', default='')
 
 # Production Security Headers (active when DEBUG=False)
 if not DEBUG:

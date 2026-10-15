@@ -40,12 +40,19 @@ class Command(BaseCommand):
 
         service = ExtractionService()
 
-        if recover_stale:
-            recovered = service.recover_stale_jobs()
-            if recovered > 0:
-                self.stdout.write(self.style.WARNING(f"Recovered {recovered} stale/abandoned in_progress job(s)."))
+        # Automatically execute stale job recovery on startup
+        recovered = service.recover_stale_jobs()
+        if recovered > 0:
+            self.stdout.write(self.style.WARNING(f"Recovered {recovered} stale/abandoned in_progress job(s)."))
 
+        poll_count = 0
         while True:
+            poll_count += 1
+            if not run_once and (recover_stale or (poll_count % 10 == 0)):
+                rec = service.recover_stale_jobs()
+                if rec > 0:
+                    self.stdout.write(self.style.WARNING(f"Automatically recovered {rec} stale/abandoned job(s)."))
+
             # Atomically claim next pending job to prevent multi-worker concurrency collisions
             job = service.claim_next_pending_job()
 
@@ -65,7 +72,7 @@ class Command(BaseCommand):
                         )
                         continue
 
-                    service.process_extraction(job_id=job.id, api_token=token)
+                    service.process_extraction(job_id=job.id, api_token=token, already_claimed=True)
                     job.refresh_from_db()
                     if job.status == JobStatus.COMPLETED:
                         self.stdout.write(self.style.SUCCESS(

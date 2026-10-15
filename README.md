@@ -228,29 +228,44 @@ All settings are configured using decoupled environment variables. See [.env.exa
 | `DEBUG` | `True` | Boolean flag toggling Django debug mode. |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,testserver` | Comma-separated list of allowed hostnames. |
 | `CSRF_TRUSTED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | Comma-separated list of trusted origins for CSRF. |
-| `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). |
+| `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). Shared dev keys prohibited in prod. |
 | `FIELD_ENCRYPTION_KEY` | *(Derived from SECRET_KEY if dev)* | 32-byte urlsafe base64 Fernet key for encrypting tokens at rest. Generate via: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. |
 | `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker pool on scan start. |
 | `EXTRACTION_MAX_WORKERS` | `4` | Maximum concurrent worker threads in the bounded extraction pool. |
-| `EXTRACTION_JOB_TIMEOUT_MINUTES` | `15` | Minutes before an abandoned in-progress job is marked timed out / failed. |
-| `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres). |
+| `EXTRACTION_JOB_TIMEOUT_MINUTES` | `15` | Minutes before an abandoned in-progress job is marked timed out / recovered. |
+| `EXTRACTION_MAX_RETRIES` | `3` | Maximum automatic retries for interrupted or stale jobs. |
+| `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres / Supabase). |
 | `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
 | `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
 | `EXTERNAL_API_DEFAULT_TOKEN` | `test-sample-service-token` | Default token for example data source. |
+| `EXTERNAL_API_PAGINATION_TYPE` | `auto` | Pagination strategy: `auto`, `cursor` (e.g. HubSpot), `offset_limit`, or `page_number`. |
+| `EXTERNAL_API_ENDPOINT_TEMPLATE` | `/posts` | Endpoint path or formatting template for provider requests. |
+| `EXTERNAL_API_RECORDS_KEY` | `""` | Optional response dictionary key holding records list (e.g. `results` or `data`). |
+| `API_REQUIRE_REQUEST_SIGNING` | `False` | Enforce cryptographic HMAC-SHA256 request signing on all protected endpoints. |
+| `API_SIGNING_TOLERANCE_SECONDS` | `300` | Permitted drift in seconds for `X-Timestamp` validation window. |
 | `LOG_LEVEL` | `INFO` | Logging threshold level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
 
 ---
 
-## API Authentication for Callers
+## API Authentication & Request Signing
 
-All protected API endpoints require the caller to authenticate using the configured `API_KEY_SECRET`.
+All protected API endpoints require callers to authenticate using the configured `API_KEY_SECRET`.
 
-Authentication is strictly **fail-closed**: if `API_KEY_SECRET` is unset, empty, or unconfigured on the server, all requests to protected endpoints are rejected with `401 Unauthorized`.
+### 1. Fail-Closed Authentication
+Authentication is strictly **fail-closed**: if `API_KEY_SECRET` is unset, empty, or unconfigured on the server, all requests to protected endpoints are rejected with `401 Unauthorized`. Known default development keys are explicitly prohibited from running in production (`DEBUG=False`).
 
 Provide the API key via any of the following HTTP headers:
 * `X-API-KEY: <your-api-key>`
 * `Authorization: Api-Key <your-api-key>`
 * `Authorization: Bearer <your-api-key>`
+
+### 2. Cryptographic HMAC-SHA256 Request Signing
+For zero-trust environments, cryptographic request signing can be enforced (`API_REQUIRE_REQUEST_SIGNING=True`) or verified whenever signatures are supplied:
+* Header `X-Timestamp`: Current UTC UNIX timestamp (e.g., `1773584820`). Requests outside the tolerance window (`API_SIGNING_TOLERANCE_SECONDS`, default 300s) are rejected with `401`.
+* Header `X-Signature`: HMAC-SHA256 signature generated with `API_KEY_SECRET` over the canonical string:
+  ```
+  <timestamp>.<HTTP_METHOD>.<PATH>.<SHA256_HEX(request_body)>
+  ```
 
 Unauthenticated requests receive `401 Unauthorized`. The operational health check (`/api/v1/health`) and OpenAPI schema views (`/api/docs/`) remain public for monitoring and documentation.
 
@@ -262,15 +277,21 @@ When `/api/v1/scan/start` is called:
 1. The endpoint validates input, hashes the token and filters, and persists the job in state `pending`.
 2. It returns `202 Accepted` with the `job_id` immediately.
 3. Because `EXTRACTION_ASYNC_EXECUTION=True`, a task is submitted to a **managed bounded ThreadPoolExecutor** (configurable via `EXTRACTION_MAX_WORKERS`, default: 4) after database commit (`transaction.on_commit`). This avoids unbounded thread spawning, ensures graceful process teardown, transitions the job to `in_progress`, paginates through records, and marks the job `completed`.
-4. Subsequent calls to `/api/v1/scan/status/<job_id>` report progress and record count, and `/api/v1/scan/result/<job_id>` serves the extracted records.
+4. Subsequent calls to `/api/v1/scan/status/<job_id>` report progress, record count, and retry metrics, and `/api/v1/scan/result/<job_id>` serves the extracted records.
+
+### Unified Atomic Job Claiming
+Both execution paths (the inline ThreadPoolExecutor worker and the standalone background worker command) share the unified, atomic claiming implementation (`ExtractionService.claim_job()`). Jobs are claimed using atomic conditional updates (`status='pending' -> status='in_progress'`), guaranteeing that multiple concurrent threads or worker processes will never double-process or race on the same job.
+
+### Automated Stale Job Recovery & Safe Retries
+Stale or interrupted jobs stranded in `in_progress` past `EXTRACTION_JOB_TIMEOUT_MINUTES` are automatically recovered during job initiation and worker cycles:
+- **Idempotent Retry Decision**: If an abandoned job has valid encrypted credentials and `retry_count < max_retries`, any partial extracted records are purged and the job is re-queued to `pending` with incremented `retry_count`.
+- **Permanent Failure**: If max retries are exceeded or credentials are unavailable, the job transitions permanently to `failed` with code `MAX_RETRIES_EXCEEDED` or `WORKER_ABANDONED_TIMEOUT`.
 
 ### Public Demo Endpoint Token Protection
 When `EXTERNAL_API_BASE_URL` points to public testing/sandbox endpoints (e.g., `jsonplaceholder.typicode.com`, `reqres.in`, `httpbin.org`), the HTTP client automatically omits the `Authorization` header to prevent leaking customer or service tokens across the public internet. For real CRM/custom endpoints, tokens are safely sent via `Authorization: Bearer <token>`.
 
 ### Standalone Polling Worker Command
-Alternatively, in multi-container or distributed environments, background execution can be handed off entirely to dedicated worker processes (`EXTRACTION_ASYNC_EXECUTION=False` on web nodes):
-* **Atomic Job Claiming (`claim_next_pending_job`)**: Workers use atomic conditional database updates (`status='pending' -> status='in_progress'`), guaranteeing that multiple concurrent worker processes will never double-process or collide on the same job.
-* **Stale Job Recovery (`--recover-stale`)**: Recovers jobs stranded in `in_progress` due to crashed worker nodes or network partitions, transitioning them to `failed` with code `WORKER_ABANDONED_TIMEOUT`.
+In multi-container or distributed environments, background execution can be handed off entirely to dedicated worker processes (`EXTRACTION_ASYNC_EXECUTION=False` on web nodes):
 
 ```bash
 # Continuous polling loop (every 2 seconds) with stale job recovery enabled
