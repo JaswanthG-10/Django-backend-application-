@@ -1,4 +1,5 @@
-"""Pytest fixtures and seeded test scenarios."""
+import socket
+
 import pytest
 from django.conf import settings
 from rest_framework.test import APIClient
@@ -17,6 +18,30 @@ from apps.extraction.tests.factories import (
 def disable_async_extraction_for_unit_tests(settings):
     """Disables background worker threads by default during unit tests for deterministic assertions."""
     settings.EXTRACTION_ASYNC_EXECUTION = False
+
+
+@pytest.fixture(autouse=True)
+def mock_dns_for_offline_test_domains(monkeypatch):
+    """Provides deterministic mock DNS resolution for standard test domains in offline unit tests."""
+    original_getaddrinfo = socket.getaddrinfo
+
+    test_domain_ips = {
+        'api.hubapi.com': '199.60.103.28',
+        'unintended-external-service.org': '93.184.215.14',
+        'crm-provider.test': '93.184.215.15',
+        'api.crm-provider.test': '93.184.215.15',
+        'jsonplaceholder.typicode.com': '104.21.4.197',
+        'crm.myenterprise.com': '93.184.215.16',
+    }
+
+    def _test_getaddrinfo(host, port=None, *args, **kwargs):
+        clean_host = (host or '').lower().strip()
+        if clean_host in test_domain_ips:
+            resolved_ip = test_domain_ips[clean_host]
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (resolved_ip, port or 443))]
+        return original_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, 'getaddrinfo', _test_getaddrinfo)
 
 
 @pytest.fixture

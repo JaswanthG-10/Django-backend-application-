@@ -13,6 +13,8 @@ from typing import Any, NamedTuple
 
 import requests
 from django.conf import settings
+from requests.adapters import HTTPAdapter
+from requests.utils import prepend_scheme_if_needed, select_proxy
 
 from apps.common.exceptions import (
     ExternalServiceAuthError,
@@ -83,6 +85,105 @@ def parse_retry_after(header_val: str | None) -> float | None:
         logger.warning("Failed to parse Retry-After header as HTTP-date: %s", exc)
 
     return None
+
+
+_CGNAT_NETWORK = ipaddress.ip_network('100.64.0.0/10')
+_IPV6_ULA_NETWORK = ipaddress.ip_network('fc00::/7')
+
+
+class PinnedIPAdapter(HTTPAdapter):
+    """Custom HTTPAdapter that pins DNS resolution to a pre-validated IP address.
+
+    Eliminates Time-of-Check to Time-of-Use (TOCTOU) DNS rebinding attacks while
+    preserving TLS SNI, TLS certificate validation, and HTTP Host headers.
+    """
+
+    def __init__(self, pinned_ips: dict[str, str] | None = None, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.pinned_ips = {k.lower().strip(): v.strip() for k, v in (pinned_ips or {}).items()}
+
+    def get_connection_with_tls_context(
+        self,
+        request: requests.PreparedRequest,
+        verify: Any,
+        proxies: dict[str, str] | None = None,
+        cert: Any = None,
+    ):
+        proxy = select_proxy(request.url, proxies)
+        host_params, pool_kwargs = self.build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        parsed = urllib.parse.urlsplit(request.url)
+        hostname = (parsed.hostname or '').lower().strip()
+        if hostname in self.pinned_ips:
+            pinned_ip = self.pinned_ips[hostname]
+            host_params['host'] = pinned_ip
+            if host_params.get('scheme') == 'https':
+                pool_kwargs['assert_hostname'] = hostname
+                pool_kwargs['server_hostname'] = hostname
+        if proxy:
+            proxy = prepend_scheme_if_needed(proxy, 'http')
+            proxy_manager = self.proxy_manager_for(proxy)
+            return proxy_manager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+        return self.poolmanager.connection_from_host(**host_params, pool_kwargs=pool_kwargs)
+
+
+def _is_restricted_ip(ip_str: str, allow_loopback: bool = False) -> bool:
+    """Checks if an IP address string belongs to any private, loopback, or reserved range.
+
+    Covers:
+    - Standard private (RFC 1918, RFC 4193)
+    - Loopback (127.0.0.0/8, ::1) unless explicitly permitted in debug mode
+    - Link-local (169.254.0.0/16, fe80::/10)
+    - Cloud metadata IP (169.254.169.254)
+    - Carrier-grade NAT / CGNAT (100.64.0.0/10 - RFC 6598)
+    - IPv6 ULA (fc00::/7, including fd00::/8)
+    - IPv4-mapped IPv6 (::ffff:127.0.0.1, etc.)
+    - Multicast, reserved, unspecified (0.0.0.0, ::)
+    """
+    try:
+        ip = ipaddress.ip_address(ip_str.strip())
+    except ValueError:
+        return True
+
+    # Unwrap IPv4-mapped IPv6 (e.g. ::ffff:127.0.0.1)
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+
+    if allow_loopback and ip.is_loopback:
+        return False
+
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+
+    if str(ip) == '169.254.169.254':
+        return True
+
+    if ip.version == 4 and ip in _CGNAT_NETWORK:
+        return True
+
+    return bool(ip.version == 6 and ip in _IPV6_ULA_NETWORK)
+
+
+def _sanitize_url_for_logging(url: str) -> str:
+    """Strips query parameters and userinfo credentials from URLs for safe logging."""
+    if not url:
+        return ''
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        netloc = parsed.hostname or ''
+        if parsed.port:
+            netloc += f":{parsed.port}"
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, '', ''))
+    except Exception:  # noqa: BLE001 - fallback if URL parsing fails
+        return '[sanitized-url]'
 
 
 class ThirdPartyExtractionClient:
@@ -196,60 +297,91 @@ class ThirdPartyExtractionClient:
         norm_path = re.sub(r'/+', '/', parsed.path)
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, norm_path, parsed.query, parsed.fragment))
 
-    @staticmethod
-    def _is_private_or_loopback_target(hostname: str) -> bool:
-        """Checks if a hostname is loopback, internal, private, or cloud metadata target.
+    @classmethod
+    def _is_loopback_allowed(cls) -> bool:
+        """Determines if loopback destinations are permitted (only when DEBUG=True and explicitly configured)."""
+        return bool(getattr(settings, 'DEBUG', False) and getattr(settings, 'EXTERNAL_API_ALLOW_LOOPBACK', False))
 
-        Blocks SSRF vectors targeting internal services, cloud metadata endpoints,
-        and private network segments.
+    @classmethod
+    def _is_host_allowed(cls, hostname: str, base_url: str | None = None) -> bool:
+        """Validates hostname against configured EXTERNAL_API_ALLOWED_HOSTS and base URL host."""
+        if not hostname:
+            return False
+        clean_host = hostname.lower().strip()
+
+        allowed_setting = getattr(settings, 'EXTERNAL_API_ALLOWED_HOSTS', None) or []
+        allowed_list = [h.lower().strip() for h in allowed_setting if h and str(h).strip()]
+
+        raw_base = base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', '')
+        base_host = (urllib.parse.urlsplit(raw_base).hostname or '').lower().strip()
+
+        if clean_host == base_host:
+            return True
+        return clean_host in allowed_list
+
+    @classmethod
+    def _resolve_and_validate_host(cls, hostname: str) -> tuple[bool, str | None]:
+        """Resolves hostname and validates all returned IP addresses against SSRF filters.
+
+        Fails closed: if hostname cannot be resolved, or if ANY resolved IP is restricted,
+        returns (False, None).
+        If all resolved IPs are safe, returns (True, first_safe_ip).
         """
         if not hostname:
-            return True
+            return False, None
         lowered = hostname.lower().strip()
+        allow_loopback = cls._is_loopback_allowed()
 
-        # Block well-known loopback and cloud metadata names
-        if lowered in ('localhost', '0.0.0.0', 'metadata.google.internal', 'metadata', 'instance-data'):
-            return True
-        if lowered.endswith(('.localhost', '.local', '.internal', '.localdomain')):
-            return True
+        # Check cloud metadata and internal domain patterns first
+        if lowered in ('metadata.google.internal', 'metadata', 'instance-data'):
+            return False, None
+        if lowered.endswith(('.internal', '.local', '.localdomain')):
+            return False, None
+        if lowered.endswith('.localhost') and not allow_loopback:
+            return False, None
 
-        # Check for direct IP address literal
+        if not allow_loopback and lowered in ('localhost', '0.0.0.0'):
+            return False, None
+
+        # Check direct IP address literal
         try:
             ip = ipaddress.ip_address(lowered)
-            return (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            )
+            if _is_restricted_ip(str(ip), allow_loopback=allow_loopback):
+                return False, None
+            return True, str(ip)
         except ValueError:
             pass
 
-        # Try DNS resolution to detect DNS rebinding or private IP mapping
+        # Resolve hostname via DNS - FAIL CLOSED on error
         try:
             addr_infos = socket.getaddrinfo(lowered, None, proto=socket.IPPROTO_TCP)
-            for addr_info in addr_infos:
-                ip_str = addr_info[4][0]
-                try:
-                    ip = ipaddress.ip_address(ip_str)
-                    if (
-                        ip.is_private
-                        or ip.is_loopback
-                        or ip.is_link_local
-                        or ip.is_multicast
-                        or ip.is_reserved
-                        or ip.is_unspecified
-                    ):
-                        return True
-                except ValueError:
-                    continue
-        except (socket.gaierror, OSError):
-            # In offline/mock test environments or if unresolvable, do not treat as private IP
-            pass
+        except (socket.gaierror, OSError) as exc:
+            logger.warning(
+                "DNS resolution failed (failing closed) for target host: %s | error=%s",
+                lowered,
+                exc
+            )
+            return False, None
 
-        return False
+        if not addr_infos:
+            logger.warning("DNS resolution returned no addresses for host: %s", lowered)
+            return False, None
+
+        # Check EVERY resolved IP address. If ANY is restricted, reject!
+        first_safe_ip = None
+        for addr in addr_infos:
+            ip_str = addr[4][0]
+            if _is_restricted_ip(ip_str, allow_loopback=allow_loopback):
+                logger.warning(
+                    "Host '%s' resolved to restricted IP address '%s'. Failing closed.",
+                    lowered,
+                    ip_str
+                )
+                return False, None
+            if first_safe_ip is None:
+                first_safe_ip = ip_str
+
+        return True, first_safe_ip
 
     @staticmethod
     def _is_same_provider_host(target_url: str, base_url: str) -> bool:
@@ -271,59 +403,74 @@ class ThirdPartyExtractionClient:
         return target_host.lower() == base_host.lower()
 
     def _validate_and_normalize_pagination_url(self, raw_url: str, current_url: str) -> str | None:
-        """Validates and normalizes pagination next URLs with SSRF protection.
-
-        Resolves relative paths, validates schemes, rejects malformed URLs,
-        blocks private/loopback/link-local/cloud metadata addresses, and rejects URLs
-        containing userinfo (user:pass@host) to prevent credential injection.
-        """
+        """Validates and normalizes pagination next URLs with complete SSRF protection."""
         if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
             return None
         cleaned = raw_url.strip()
         resolved = urllib.parse.urljoin(current_url, cleaned)
         parsed = urllib.parse.urlsplit(resolved)
+        sanitized_for_log = _sanitize_url_for_logging(resolved)
+
         if parsed.scheme.lower() not in ('http', 'https'):
             logger.warning("Rejected pagination URL with unsupported scheme: %s", parsed.scheme)
             return None
         if not getattr(settings, 'DEBUG', True) and parsed.scheme.lower() != 'https':
-            logger.warning("Rejected non-HTTPS pagination URL in production: %s", resolved)
+            logger.warning("Rejected non-HTTPS pagination URL in production: %s", sanitized_for_log)
             return None
         # Block userinfo in URL (e.g. https://user:pass@evil.com) to prevent credential injection
         if parsed.username or parsed.password:
             logger.warning("Rejected pagination URL containing userinfo credentials.")
             return None
-        # Block private/loopback/link-local/reserved IP addresses and metadata endpoints to prevent SSRF
         hostname = parsed.hostname
-        if not hostname or self._is_private_or_loopback_target(hostname):
+        if not hostname:
+            logger.warning("Rejected pagination URL with missing host.")
+            return None
+        if not self._is_host_allowed(hostname, self.base_url):
             logger.warning(
-                "Rejected pagination URL targeting private/loopback/reserved destination: %s", hostname
+                "Rejected pagination URL: host '%s' is not in configured allowlist.",
+                hostname
             )
             return None
-        return resolved
+        is_safe, _ = self._resolve_and_validate_host(hostname)
+        if not is_safe:
+            logger.warning(
+                "Rejected pagination URL targeting restricted/unresolvable destination: %s",
+                hostname
+            )
+            return None
 
-    @classmethod
-    def _check_redirect_ssrf(cls, response: requests.Response, *args: Any, **kwargs: Any) -> requests.Response:
-        """Validates redirect targets to prevent redirect-based SSRF attacks.
+        # Return resolved URL without fragment
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, parsed.query, ''))
 
-        Inspects redirect responses (3xx) before the next hop is requested. If the redirect target
-        points to a private, loopback, link-local, or cloud metadata address, aborts the request.
-        """
-        if response.is_redirect or (300 <= response.status_code < 400):
-            location = response.headers.get('Location')
-            if location:
-                resolved = urllib.parse.urljoin(response.url, location)
-                parsed = urllib.parse.urlsplit(resolved)
-                hostname = parsed.hostname
-                if hostname and cls._is_private_or_loopback_target(hostname):
-                    logger.error(
-                        "Blocked redirect to restricted or loopback destination | location=%s target=%s",
-                        location, resolved
-                    )
-                    raise ExternalServiceError(
-                        message=f"Redirect to restricted destination '{hostname}' is prohibited.",
-                        details={'location': location, 'reason': 'ssrf_redirect_blocked'}
-                    )
-        return response
+    def _check_redirect_ssrf(self, response: requests.Response, *args: Any, **kwargs: Any) -> None:
+        """Validates redirect targets against SSRF protections."""
+        resp_status = getattr(response, 'status_code', None)
+        if not (getattr(response, 'is_redirect', False) or (isinstance(resp_status, int) and 300 <= resp_status < 400)):
+            return
+        location = None
+        if hasattr(response, 'headers') and hasattr(response.headers, 'get'):
+            raw_loc = response.headers.get('Location')
+            if isinstance(raw_loc, str):
+                location = raw_loc.strip()
+
+        if not location:
+            return
+
+        current_url = getattr(response, 'url', self.base_url)
+        target_url = urllib.parse.urljoin(current_url, location)
+        parsed = urllib.parse.urlsplit(target_url)
+        hostname = (parsed.hostname or '').lower().strip()
+        if not hostname:
+            raise ExternalServiceError(
+                message="Redirect target has no valid host.",
+                details={'reason': 'ssrf_redirect_blocked', 'url': _sanitize_url_for_logging(target_url)}
+            )
+        is_safe, _ = self._resolve_and_validate_host(hostname)
+        if not is_safe:
+            raise ExternalServiceError(
+                message=f"Redirect to restricted destination '{hostname}' is prohibited.",
+                details={'reason': 'ssrf_redirect_blocked', 'host': hostname, 'url': _sanitize_url_for_logging(target_url)}
+            )
 
     def _execute_request_with_retries(
         self,
@@ -332,13 +479,12 @@ class ThirdPartyExtractionClient:
         params: dict[str, Any],
         max_retry_after: float | None = None,
         heartbeat_callback: Callable[[], None] | None = None,
-        allow_redirects: bool = True,
     ) -> requests.Response:
         """Executes GET request with separate retry budgets for 429 rate limits and 5xx/timeout errors.
-        
-        Honors server Retry-After (seconds and HTTP-date), enforces per-wait and cumulative total wait
-        deadlines, applies chunked heartbeat updates during wait intervals, and guarantees tokens are
-        never leaked in 429 logs or error messages.
+
+        Applies DNS pinning (anti-TOCTOU), manual redirect following (max 3 hops),
+        per-hop host allowlisting and IP re-validation, Authorization header stripping
+        on host change, and chunked heartbeat updates during wait intervals.
         """
         server_attempts = 0
         rate_limit_attempts = 0
@@ -355,38 +501,122 @@ class ThirdPartyExtractionClient:
         heartbeat_chunk_seconds = getattr(settings, 'EXTRACTION_HEARTBEAT_CHUNK_SECONDS', 30.0)
 
         while True:
-            try:
-                response = self.session.get(
-                    url,
-                    headers=headers,
-                    params=params,
-                    timeout=self.timeout,
-                    allow_redirects=allow_redirects,
-                    hooks={'response': [self._check_redirect_ssrf]},
-                )
-            except requests.exceptions.Timeout as exc:
-                server_attempts += 1
-                if server_attempts <= self.max_retries:
-                    jitter = random.uniform(0.05, 0.15)
-                    delay = backoff_delay + jitter
-                    logger.warning(
-                        "Request timed out on server attempt %d/%d; retrying in %.2fs | url=%s",
-                        server_attempts, self.max_retries, delay, url
+            current_url = url
+            redirect_count = 0
+            visited_redirect_urls: set[str] = set()
+            req_headers = dict(headers)
+            req_params = dict(params)
+            response = None
+
+            while True:
+                sanitized_url = _sanitize_url_for_logging(current_url)
+                parsed = urllib.parse.urlsplit(current_url)
+                if parsed.scheme.lower() not in ('http', 'https'):
+                    raise ExternalServiceError(
+                        message=f"Unsupported URL scheme '{parsed.scheme}'.",
+                        details={'url': sanitized_url}
                     )
-                    time.sleep(delay)
-                    backoff_delay *= 2
+                if not getattr(settings, 'DEBUG', True) and parsed.scheme.lower() != 'https':
+                    raise ExternalServiceError(
+                        message="External provider URL must use HTTPS in production.",
+                        details={'url': sanitized_url}
+                    )
+                if parsed.username or parsed.password:
+                    raise ExternalServiceError(
+                        message="URL containing user credentials is prohibited.",
+                        details={'url': sanitized_url}
+                    )
+                if not parsed.hostname or not self._is_host_allowed(parsed.hostname, self.base_url):
+                    raise ExternalServiceError(
+                        message=f"Target host '{parsed.hostname}' is not permitted by host allowlist.",
+                        details={'host': parsed.hostname}
+                    )
+
+                is_safe, pinned_ip = self._resolve_and_validate_host(parsed.hostname)
+                if not is_safe or not pinned_ip:
+                    raise ExternalServiceError(
+                        message=f"Target host '{parsed.hostname}' is restricted or cannot be resolved.",
+                        details={'host': parsed.hostname}
+                    )
+
+                # Ensure Authorization header is stripped on host change or demo endpoint
+                if not self._is_same_provider_host(current_url, self.base_url) or self._is_public_demo_endpoint(current_url):
+                    req_headers.pop('Authorization', None)
+
+                # Pin validated IP address to eliminate TOCTOU rebinding
+                pinned_adapter = PinnedIPAdapter(pinned_ips={parsed.hostname: pinned_ip})
+                self.session.mount('https://', pinned_adapter)
+                self.session.mount('http://', pinned_adapter)
+
+                try:
+                    response = self.session.get(
+                        current_url,
+                        headers=req_headers,
+                        params=req_params if redirect_count == 0 else None,
+                        timeout=self.timeout,
+                        allow_redirects=False,
+                    )
+                except requests.exceptions.Timeout as exc:
+                    server_attempts += 1
+                    if server_attempts <= self.max_retries:
+                        jitter = random.uniform(0.05, 0.15)
+                        delay = backoff_delay + jitter
+                        logger.warning(
+                            "Request timed out on server attempt %d/%d; retrying in %.2fs | url=%s",
+                            server_attempts, self.max_retries, delay, sanitized_url
+                        )
+                        time.sleep(delay)
+                        backoff_delay *= 2
+                        response = None
+                        break
+                    logger.error("External service timeout after %d attempts | url=%s", server_attempts, sanitized_url)
+                    raise ExternalServiceTimeoutError(
+                        message=f"External data source timed out after {self.timeout} seconds.",
+                        details={'url': sanitized_url, 'timeout_seconds': self.timeout}
+                    ) from exc
+                except requests.exceptions.RequestException as exc:
+                    logger.error("External connection error | url=%s error=%s", sanitized_url, str(exc))
+                    raise ExternalServiceError(
+                        message="Unable to connect to external data extraction service.",
+                        details={'url': sanitized_url, 'reason': 'Connection failure'}
+                    ) from exc
+
+                # Check for redirect responses (301, 302, 303, 307, 308)
+                resp_status = getattr(response, 'status_code', None)
+                if isinstance(resp_status, int) and (resp_status in (301, 302, 303, 307, 308) or (300 <= resp_status < 400)):
+                    redirect_count += 1
+                    if redirect_count > 3:
+                        logger.error("Too many redirects: exceeded maximum 3 hops | url=%s", sanitized_url)
+                        raise ExternalServiceError(
+                            message="Too many redirects: exceeded maximum hop limit of 3.",
+                            details={'hops': redirect_count, 'url': sanitized_url}
+                        )
+                    location = None
+                    if hasattr(response, 'headers') and hasattr(response.headers, 'get'):
+                        raw_loc = response.headers.get('Location')
+                        if isinstance(raw_loc, str):
+                            location = raw_loc.strip()
+
+                    if not location:
+                        break
+
+                    next_target = urllib.parse.urljoin(current_url, location)
+                    sanitized_next = _sanitize_url_for_logging(next_target)
+                    if next_target in visited_redirect_urls:
+                        logger.error("Redirect loop detected | url=%s", sanitized_next)
+                        raise ExternalServiceError(
+                            message=f"Redirect loop detected: '{sanitized_next}' was previously visited.",
+                            details={'url': sanitized_next}
+                        )
+                    visited_redirect_urls.add(current_url)
+                    visited_redirect_urls.add(next_target)
+                    current_url = next_target
                     continue
-                logger.error("External service timeout after %d attempts | url=%s", server_attempts, url)
-                raise ExternalServiceTimeoutError(
-                    message=f"External data source timed out after {self.timeout} seconds.",
-                    details={'url': url, 'timeout_seconds': self.timeout}
-                ) from exc
-            except requests.exceptions.RequestException as exc:
-                logger.error("External connection error | url=%s error=%s", url, str(exc))
-                raise ExternalServiceError(
-                    message="Unable to connect to external data extraction service.",
-                    details={'url': url, 'reason': 'Connection failure'}
-                ) from exc
+
+                break
+
+            if response is None:
+                continue
 
             status_code = response.status_code
 
@@ -521,12 +751,13 @@ class ThirdPartyExtractionClient:
             'User-Agent': 'GreenTree-DataExtractionClient/1.0',
         }
 
+        sanitized_init_url = _sanitize_url_for_logging(url)
         # Prevent tokens from being sent to public demo/mock sandbox endpoints
         if self._is_public_demo_endpoint(url):
             logger.info(
                 "Target URL '%s' is a public demo/sandbox endpoint. "
                 "Omitted Authorization header to prevent token leakage.",
-                url
+                sanitized_init_url
             )
         else:
             headers['Authorization'] = f"Bearer {api_token.strip()}"
@@ -534,7 +765,7 @@ class ThirdPartyExtractionClient:
         masked = self._mask_token(api_token)
         logger.info(
             "Initiating external extraction | url=%s source=%s token=%s params=%s",
-            url, source_type, masked, filters
+            sanitized_init_url, source_type, masked, filters
         )
 
         all_records: list[dict[str, Any]] = []
@@ -638,22 +869,23 @@ class ThirdPartyExtractionClient:
                     details={'status_code': status_code}
                 )
 
+            sanitized_current_url = _sanitize_url_for_logging(current_req_url)
             if status_code == 404:
-                logger.warning("External resource not found | url=%s", url)
+                logger.warning("External resource not found | url=%s", sanitized_current_url)
                 raise ResourceNotFoundError(
                     message="Requested data source resource not found at external provider.",
-                    details={'url': url, 'status_code': 404}
+                    details={'url': sanitized_current_url, 'status_code': 404}
                 )
 
             if status_code == 429:
-                logger.warning("External service rate limit hit after retries | url=%s", url)
+                logger.warning("External service rate limit hit after retries | url=%s", sanitized_current_url)
                 raise RateLimitExceededError(
                     message="External provider rate limit exceeded. Please back off and retry.",
                     details={'status_code': 429}
                 )
 
             if status_code >= 500:
-                logger.error("External service server error | status=%d url=%s", status_code, url)
+                logger.error("External service server error | status=%d url=%s", status_code, sanitized_current_url)
                 raise ExternalServiceError(
                     message=f"External service encountered a server error (HTTP {status_code}).",
                     details={'status_code': status_code}
