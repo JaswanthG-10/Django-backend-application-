@@ -1,8 +1,10 @@
 """Regression tests verifying pagination continuation, URL safety, and background worker reliability."""
+import socket
 import time
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from cryptography.fernet import Fernet
 from django.test import override_settings
 from django.utils import timezone
@@ -228,6 +230,7 @@ class TestPaginationRegressions:
             assert result.truncated is True
             assert len(result.records) == 2
 
+    @override_settings(EXTERNAL_API_ALLOWED_HOSTS=['unintended-external-service.org'])
     def test_unintended_host_in_next_url_strips_authorization_header(self, extraction_client):
         """Case 10: External pagination links do not leak bearer tokens to unintended hosts.
         Legitimate same-provider pagination links preserve the Authorization header.
@@ -583,3 +586,185 @@ class TestBackgroundExtractionReliability:
             with pytest.raises(ValueError) as exc_info:
                 decrypt_secret(cipher_wrong)
             assert "Failed to decrypt stored credential" in str(exc_info.value)
+
+
+class TestSSRFHardeningAndProtection:
+    """Comprehensive regression tests verifying complete SSRF hardening and anti-rebinding defenses."""
+
+    def test_dns_resolution_failure_fails_closed(self, extraction_client):
+        """1. DNS resolution failure fails closed: unresolvable host is rejected."""
+        with patch('socket.getaddrinfo', side_effect=socket.gaierror(11001, "getaddrinfo failed")):
+            validated = extraction_client._validate_and_normalize_pagination_url(
+                "https://nonexistent-domain.xyz/records",
+                "https://api.hubapi.com/crm/v3/objects/contacts"
+            )
+            assert validated is None
+
+    def test_mixed_public_and_private_ips_rejected(self, extraction_client):
+        """2. Mixed public and private IPs: host resolving to both 93.184.215.14 and 10.0.0.1 is rejected."""
+        mixed_addrs = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('93.184.215.14', 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, '', ('10.0.0.1', 443)),
+        ]
+        with patch('socket.getaddrinfo', return_value=mixed_addrs):
+            is_safe, ip = extraction_client._resolve_and_validate_host("evil-dual-homed.com")
+            assert is_safe is False
+            assert ip is None
+
+    @pytest.mark.parametrize("target", [
+        "127.0.0.1",
+        "10.0.0.5",
+        "172.16.0.1",
+        "192.168.1.1",
+        "169.254.169.254",
+        "::1",
+        "::ffff:127.0.0.1",
+        "100.64.0.1",
+        "metadata.google.internal",
+        "localhost",
+        "cluster.internal",
+        "printer.local",
+    ])
+    def test_every_restricted_target_is_rejected(self, extraction_client, target):
+        """3. Every restricted target is rejected by host validation."""
+        is_safe, ip = extraction_client._resolve_and_validate_host(target)
+        assert is_safe is False
+        assert ip is None
+
+    def test_dns_rebinding_prevention_pins_initial_ip(self, extraction_client):
+        """4. DNS rebinding prevention: PinnedIPAdapter connects to pinned IP and never queries DNS during request."""
+        from apps.extraction.clients import PinnedIPAdapter
+
+        adapter = PinnedIPAdapter(pinned_ips={'api.hubapi.com': '199.60.103.28'})
+        prep = requests.PreparedRequest()
+        prep.url = 'https://api.hubapi.com/crm/v3/objects/contacts'
+        prep.headers = {}
+
+        with patch.object(adapter.poolmanager, 'connection_from_host') as mock_conn:
+            adapter.get_connection_with_tls_context(prep, verify=True)
+            mock_conn.assert_called_once()
+            call_kwargs = mock_conn.call_args[1]
+            assert call_kwargs['pool_kwargs']['server_hostname'] == 'api.hubapi.com'
+            assert call_kwargs['pool_kwargs']['assert_hostname'] == 'api.hubapi.com'
+            assert call_kwargs.get('host') == '199.60.103.28' or mock_conn.call_args[0][0] == '199.60.103.28'
+
+    @override_settings(EXTERNAL_API_ALLOWED_HOSTS=['10.0.0.1'])
+    def test_redirect_to_private_ip_is_blocked(self, extraction_client):
+        """5a. Redirect to private IP is blocked."""
+        resp_302 = MagicMock(status_code=302, headers={'Location': 'https://10.0.0.1/stolen'})
+        with patch.object(extraction_client.session, 'get', return_value=resp_302):
+            with pytest.raises(ExternalServiceError) as exc_info:
+                extraction_client._execute_request_with_retries(
+                    "https://api.hubapi.com/crm/v3/objects/contacts",
+                    headers={'Authorization': 'Bearer secret'},
+                    params={}
+                )
+            assert "restricted or cannot be resolved" in str(exc_info.value.message)
+
+    @override_settings(EXTERNAL_API_ALLOWED_HOSTS=['unintended-external-service.org'])
+    def test_redirect_to_allowlisted_public_host_strips_authorization(self, extraction_client):
+        """5b. Redirect to allowlisted public host succeeds and Authorization header is not forwarded."""
+        resp_302 = MagicMock(status_code=302, headers={'Location': 'https://unintended-external-service.org/v1/records'})
+        resp_200 = MagicMock(status_code=200, headers={})
+
+        calls = []
+
+        def capture_get(url, headers, **kwargs):
+            calls.append((url, dict(headers)))
+            if len(calls) == 1:
+                return resp_302
+            return resp_200
+
+        with patch.object(extraction_client.session, 'get', side_effect=capture_get):
+            final_resp = extraction_client._execute_request_with_retries(
+                "https://api.hubapi.com/crm/v3/objects/contacts",
+                headers={'Authorization': 'Bearer secret-token'},
+                params={}
+            )
+            assert final_resp == resp_200
+            assert len(calls) == 2
+            first_url, first_hdr = calls[0]
+            assert "api.hubapi.com" in first_url
+            assert first_hdr.get('Authorization') == 'Bearer secret-token'
+
+            second_url, second_hdr = calls[1]
+            assert "unintended-external-service.org" in second_url
+            assert 'Authorization' not in second_hdr
+
+    def test_redirect_loop_detected_and_fails_cleanly(self, extraction_client):
+        """5c. Redirect loop detected and fails cleanly."""
+        resp_loop = MagicMock(status_code=302, headers={'Location': 'https://api.hubapi.com/crm/v3/objects/contacts'})
+        with patch.object(extraction_client.session, 'get', return_value=resp_loop):
+            with pytest.raises(ExternalServiceError) as exc_info:
+                extraction_client._execute_request_with_retries(
+                    "https://api.hubapi.com/crm/v3/objects/contacts",
+                    headers={'Authorization': 'Bearer secret'},
+                    params={}
+                )
+            assert "Redirect loop detected" in str(exc_info.value.message)
+
+    def test_redirect_exceeding_three_hops_fails_cleanly(self, extraction_client):
+        """5d. Exceeding maximum 3 redirect hops raises ExternalServiceError."""
+        def make_redirect_hop(hop):
+            return MagicMock(status_code=302, headers={'Location': f'https://api.hubapi.com/hop_{hop}'})
+
+        hops = [make_redirect_hop(1), make_redirect_hop(2), make_redirect_hop(3), make_redirect_hop(4)]
+        with patch.object(extraction_client.session, 'get', side_effect=hops):
+            with pytest.raises(ExternalServiceError) as exc_info:
+                extraction_client._execute_request_with_retries(
+                    "https://api.hubapi.com/start",
+                    headers={'Authorization': 'Bearer secret'},
+                    params={}
+                )
+            assert "Too many redirects" in str(exc_info.value.message)
+
+    def test_userinfo_in_url_rejected(self, extraction_client):
+        """6. Userinfo in URL is rejected in both initial request and pagination."""
+        with pytest.raises(ExternalServiceError) as exc_info:
+            extraction_client._execute_request_with_retries(
+                "https://user:password@api.hubapi.com/crm/v3/objects/contacts",
+                headers={},
+                params={}
+            )
+        assert "user credentials" in str(exc_info.value.message)
+
+        norm = extraction_client._validate_and_normalize_pagination_url(
+            "https://user:pass@api.hubapi.com/next",
+            "https://api.hubapi.com/start"
+        )
+        assert norm is None
+
+    def test_loopback_allowed_only_in_debug_with_setting(self, extraction_client):
+        """7. Loopback allowed only when DEBUG=True and EXTERNAL_API_ALLOW_LOOPBACK=True; rejected in production."""
+        with override_settings(DEBUG=True, EXTERNAL_API_ALLOW_LOOPBACK=True):
+            is_safe, ip = extraction_client._resolve_and_validate_host("127.0.0.1")
+            assert is_safe is True
+            assert ip == "127.0.0.1"
+
+        with override_settings(DEBUG=False, EXTERNAL_API_ALLOW_LOOPBACK=True):
+            is_safe, ip = extraction_client._resolve_and_validate_host("127.0.0.1")
+            assert is_safe is False
+            assert ip is None
+
+        with override_settings(DEBUG=True, EXTERNAL_API_ALLOW_LOOPBACK=False):
+            is_safe, ip = extraction_client._resolve_and_validate_host("127.0.0.1")
+            assert is_safe is False
+            assert ip is None
+
+    def test_logs_do_not_contain_token_or_userinfo_for_rejected_urls(self, extraction_client, caplog):
+        """8. Logs for failed/rejected URLs do not leak tokens, userinfo, or sensitive query params."""
+        import logging
+        caplog.set_level(logging.DEBUG)
+
+        sensitive_url = "https://admin:supersecret@api.hubapi.com/crm/v3/objects/contacts?token=leaked_secret_token_123"
+        with pytest.raises(ExternalServiceError):
+            extraction_client._execute_request_with_retries(
+                sensitive_url,
+                headers={},
+                params={}
+            )
+
+        log_text = caplog.text
+        assert "supersecret" not in log_text
+        assert "leaked_secret_token_123" not in log_text
+        assert "admin:" not in log_text
