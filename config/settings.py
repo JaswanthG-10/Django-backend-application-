@@ -316,6 +316,20 @@ EXTERNAL_API_MAX_RATE_LIMIT_RETRIES = config('EXTERNAL_API_MAX_RATE_LIMIT_RETRIE
 EXTERNAL_API_MAX_RETRY_AFTER_SECONDS = config('EXTERNAL_API_MAX_RETRY_AFTER_SECONDS', default=60.0, cast=float)
 EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS = config('EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS', default=300.0, cast=float)
 
+# Allowed destination hosts for external data extraction pagination and redirects.
+# Default empty list means only the host specified in EXTERNAL_API_BASE_URL is permitted.
+EXTERNAL_API_ALLOWED_HOSTS = config(
+    'EXTERNAL_API_ALLOWED_HOSTS',
+    default='',
+    cast=Csv()
+)
+
+# Loopback destination permission for local mock server development.
+# Strictly prohibited when DEBUG=False (production).
+EXTERNAL_API_ALLOW_LOOPBACK = config('EXTERNAL_API_ALLOW_LOOPBACK', default=False, cast=parse_bool)
+if not DEBUG and EXTERNAL_API_ALLOW_LOOPBACK:
+    raise ImproperlyConfigured("EXTERNAL_API_ALLOW_LOOPBACK is strictly prohibited in production (DEBUG=False).")
+
 # Validate external API base URL configuration
 if EXTERNAL_API_BASE_URL:
     _parsed_base = urllib.parse.urlparse(EXTERNAL_API_BASE_URL)
