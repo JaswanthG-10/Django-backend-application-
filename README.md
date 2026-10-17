@@ -372,6 +372,17 @@ To create a superuser for accessing the Django Admin:
 python manage.py createsuperuser
 ```
 
+### Token Re-encryption & Zero-Downtime Key Rotation
+When rotating `FIELD_ENCRYPTION_KEY` using MultiFernet (`<new_primary_key>,<old_fallback_key>`), stored database tokens can be safely verified and re-encrypted with zero downtime:
+
+```bash
+# Check if any stored tokens depend on fallback keys without making modifications:
+python manage.py reencrypt_tokens --verify-only
+
+# Atomically re-encrypt all stored tokens under the active primary key:
+python manage.py reencrypt_tokens
+```
+
 ---
 
 ## Running the Application
@@ -435,7 +446,7 @@ The test suite is built strictly against the **[GreenTree Test Guidelines V1.md]
 pytest -v
 ```
 
-### Test Categories Covered (121 Automated Tests)
+### Test Categories Covered (201 Automated Tests)
 
 1. **API Authentication & Fail-Closed Security Tests:**
    - Verifies missing API key returns `401 Unauthorized`.
@@ -506,6 +517,20 @@ pytest -v
     - Extreme pagination bounds (oversized limit bounded to 100, out-of-range offset).
 16. **N+1 Query Performance Tests:**
     - Query count assertions using `django_assert_num_queries` ensuring result listing and job listing maintain constant query counts regardless of dataset volume.
+17. **SSRF Mitigation & Host Pinning Tests:**
+    - Fail-closed DNS resolution for untrusted hostnames.
+    - Host-to-IP pinning preventing DNS-rebinding (TOCTOU) bypasses.
+    - Manual per-hop validation on redirects with credential stripping across cross-host redirects.
+    - Rejection of private subnets, loopback, link-local, carrier-grade NAT (100.64.0.0/10), cloud metadata (169.254.169.254), and IPv4-mapped IPv6.
+18. **Compromised Secret Detection & Blocklist Tests:**
+    - SHA-256 blocklists detecting historically compromised credentials or placeholder values.
+    - Constant-time hash verification via `hmac.compare_digest`.
+    - Fail-fast production refusal if prohibited credentials or empty secrets are configured.
+    - Automated repository sanitization test asserting no tracked file contains prohibited credentials.
+19. **MultiFernet Zero-Downtime Key Rotation & Re-encryption Tests:**
+    - MultiFernet key rotation (`<new_primary_key>,<old_fallback_key>`) with backwards-compatible decryption.
+    - Database re-encryption command (`python manage.py reencrypt_tokens`) and verification mode (`--verify-only`).
+    - Automated rotation helper (`scripts/rotate_secrets.py`) with safeguards preventing dropping old keys while stored data depends on them.
 
 ---
 

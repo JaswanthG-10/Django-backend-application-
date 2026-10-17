@@ -91,7 +91,18 @@ The `FIELD_ENCRYPTION_KEY` encrypts sensitive external tokens stored in `Extract
    - **Encryption** always uses the first (primary) key.
    - **Decryption** automatically attempts keys in order, successfully decrypting existing database tokens encrypted under the previous key.
    - When a job token is accessed and saved or re-encrypted, it is written using the primary key.
-3. Once all legacy encrypted rows have been re-encrypted or the corresponding jobs have reached terminal status (at which point tokens are automatically purged), remove `<old_fallback_key>` from `FIELD_ENCRYPTION_KEY`.
+3. Re-encrypt all existing database records using the Django management command:
+   ```bash
+   # Check if any database tokens require fallback keys:
+   python manage.py reencrypt_tokens --verify-only
+
+   # Re-encrypt all stored tokens under the new primary key:
+   python manage.py reencrypt_tokens
+   ```
+4. Once verification confirms 0 records depend on old keys, prune the old fallback key:
+   ```bash
+   python scripts/rotate_secrets.py --prune-old-keys
+   ```
 
 ---
 
@@ -107,21 +118,27 @@ The `FIELD_ENCRYPTION_KEY` encrypts sensitive external tokens stored in `Extract
 
 ## Automated Local Rotation Script (`scripts/rotate_secrets.py`)
 
-A automated helper script is provided to safely rotate local environment credentials without manual string generation or accidental credential leakage:
+An automated helper script is provided to safely rotate local environment credentials without manual string generation or accidental credential leakage:
 
 ```bash
 # Standard rotation: generates new SECRET_KEY, API_KEY_SECRET, and FIELD_ENCRYPTION_KEY,
 # preserving the previous FIELD_ENCRYPTION_KEY as fallback (<NEW>,<OLD>):
 python scripts/rotate_secrets.py
 
-# Drop legacy encryption keys once historical data is re-encrypted:
-python scripts/rotate_secrets.py --drop-old-encryption-key
+# Step 2: Restart backend services so the new primary key is active.
+
+# Step 3: Re-encrypt existing stored database records under the new primary key:
+python manage.py reencrypt_tokens
+
+# Step 4: Safely prune old fallback keys (refuses to run if any records still depend on old keys):
+python scripts/rotate_secrets.py --prune-old-keys
 ```
 
-### Script Security Features:
+### Script Security Features & Safeguards:
 - **Strict File Safety**: The script requires the target file to be named `.env` and checks `git ls-files --error-unmatch .env` to verify the file is NOT tracked by git.
 - **Automated Backup**: Generates a timestamped `.env.bak-YYYYMMDDTHHMMSSZ` file before altering any lines.
 - **Zero-Leakage Output**: Secret values are generated in memory and written directly to disk. Only setting names and operational summaries are printed to terminal output.
+- **Data Protection Safeguard**: Refuses to drop old encryption keys if any stored database records still depend on fallback keys (preventing accidental data loss). Use `--reencrypt` to automatically re-encrypt records before dropping, or `--force-drop` to bypass.
 - **Preserves Configuration**: Preserves existing file comments, spacing, and unrelated environment variables.
 
 ---
@@ -136,17 +153,17 @@ When rotating secrets in production, follow this sequenced workflow to avoid ser
     API Tokens, Webhooks)       update DATABASE_URL)          processes)
          |                             |                           |
          v                             v                           v
-4. Verification         ->  5. Data Re-encryption     ->  6. Drop Fallback Keys
-   (Health checks 200,         (Migrate encrypted            (Run rotate_secrets.py
-    Verify API keys)            records to new key)           --drop-old-encryption-key)
+4. Verification         ->  5. Data Re-encryption     ->  6. Prune Fallback Keys
+   (Health checks 200,         (python manage.py             (python rotate_secrets.py
+    Verify API keys)            reencrypt_tokens)             --prune-old-keys)
 ```
 
 1. **Rotate External Services First**: Provision new database credentials in your database console and generate new third-party API tokens/webhook secrets in upstream developer portals.
 2. **Update Environment**: Run `python scripts/rotate_secrets.py` (or inject new secrets via your production vault/CI store) and update external URLs/tokens.
 3. **Restart Application Services**: Restart all web and worker processes to reload configuration.
 4. **Verify Health and Operations**: Validate that `GET /api/v1/health` returns 200 and test endpoints with the newly issued credentials.
-5. **Re-encrypt Stored Data**: Re-encrypt legacy database fields using the new primary key (or allow active extraction jobs to complete and automatically scrub sensitive tokens).
-6. **Drop Legacy Fallback Keys**: Once all historical records have been re-encrypted, run `python scripts/rotate_secrets.py --drop-old-encryption-key` to complete the rotation cycle.
+5. **Re-encrypt Stored Data**: Re-encrypt legacy database fields using the new primary key (`python manage.py reencrypt_tokens`).
+6. **Prune Legacy Fallback Keys**: Once all historical records have been re-encrypted and verified (`python manage.py reencrypt_tokens --verify-only`), run `python scripts/rotate_secrets.py --prune-old-keys` to complete the rotation cycle.
 
 ---
 
