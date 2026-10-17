@@ -212,20 +212,51 @@ Django-backend-application-/
    ```
 
 4. **Configure environment variables:**
+   - **For Local Development (SQLite & DEBUG=True):**
+     ```bash
+     cp .env.example .env
+     ```
+     *(The default `.env.example` is pre-configured with `DEBUG=True`, SQLite, and fake placeholder credentials for instant local execution).*
+   - **For Production (PostgreSQL & DEBUG=False):**
+     ```bash
+     cp .env.production.example .env
+     ```
+     *(In production, `DEBUG=False` and a PostgreSQL `DATABASE_URL` are required. SQLite is strictly prohibited when `DEBUG=False`).*
+
+5. **Generating Cryptographic Keys for Production:**
+   - **Django `SECRET_KEY` (50+ random urlsafe characters):**
+     ```bash
+     python -c "import secrets; print(secrets.token_urlsafe(50))"
+     ```
+   - **AES-Fernet `FIELD_ENCRYPTION_KEY` (32-byte urlsafe base64 key):**
+     ```bash
+     python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+     ```
+   - **Service `API_KEY_SECRET`:**
+     ```bash
+     python -c "import secrets; print(secrets.token_urlsafe(32))"
+     ```
+
+6. **Apply Database Migrations:**
    ```bash
-   cp .env.example .env
+   python manage.py migrate
+   ```
+
+7. **Start the Development Server:**
+   ```bash
+   python manage.py runserver 8000
    ```
 
 ---
 
 ## Environment Variables
 
-All settings are configured using decoupled environment variables. See [.env.example](file:///.env.example):
+All settings are configured using decoupled environment variables. See [.env.example](file:///.env.example) for local development and [.env.production.example](file:///.env.production.example) for production deployments:
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. Must be strong and non-default in production (`DEBUG=False`). |
-| `DEBUG` | `False` | Boolean flag toggling Django debug mode (defaults to `False` for production security). |
+| `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. Must be strong (50+ chars) and non-default in production (`DEBUG=False`). |
+| `DEBUG` | `False` (`True` in `.env.example`) | Boolean flag toggling Django debug mode (SQLite allowed only when `True`). |
 | `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,testserver` | Comma-separated list of allowed hostnames (must be explicitly configured when `DEBUG=False`). |
 | `CSRF_TRUSTED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | Comma-separated list of trusted origins for CSRF. |
 | `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). Shared dev keys prohibited in prod. |
