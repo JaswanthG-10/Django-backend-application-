@@ -12,16 +12,23 @@ from pathlib import Path
 import pytest
 from cryptography.fernet import Fernet
 from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
 
 from apps.common.encryption import decrypt_secret, encrypt_secret, get_fernet, reset_fernet
+from apps.extraction.models import ExtractionJob
+from apps.extraction.services import ExtractionService
 from config.settings import (
     _PROHIBITED_API_KEY_HASHES,
     _PROHIBITED_FIELD_ENCRYPTION_KEY_HASHES,
     _PROHIBITED_SECRET_KEY_HASHES,
     _is_prohibited_hash,
 )
-from scripts.rotate_secrets import main as rotate_secrets_main
-from scripts.rotate_secrets import rotate_secrets
+from scripts.rotate_secrets import (
+    main as rotate_secrets_main,
+)
+from scripts.rotate_secrets import (
+    rotate_secrets,
+)
 
 
 class TestProhibitedSecretHashes:
@@ -41,14 +48,24 @@ class TestProhibitedSecretHashes:
                 assert len(digest) == 64, f"Digest {digest} in {name} does not have length 64"
                 assert hex_pattern.match(digest), f"Digest {digest} in {name} is not a valid 64-char lowercase hex string"
 
-    def test_settings_validation_rejects_every_prohibited_hash_and_accepts_fresh_random(self):
-        """Tests that _is_prohibited_hash returns True for dummy strings with matching hashes, and False for random values."""
-        for digest in _PROHIBITED_SECRET_KEY_HASHES:
-            # We construct a mock string matching the hash to ensure the matching logic works
-            # (By property of sha256, if any string hashes to digest, it must be detected)
-            assert digest in _PROHIBITED_SECRET_KEY_HASHES
+    def test_settings_validation_rejects_matching_canary_hash_and_accepts_fresh_random(self):
+        """Tests that _is_prohibited_hash detects matched SHA-256 hashes and accepts unblocked values."""
+        canary_secret = "test-canary-secret-value-for-unit-testing-only-12345"
+        canary_hash = hashlib.sha256(canary_secret.strip().encode('utf-8')).hexdigest()
+        test_blocklist = {canary_hash}
 
-        # Fresh random values must never match the blocklists
+        # Canary matches exactly
+        assert _is_prohibited_hash(canary_secret, test_blocklist) is True
+        # Whitespace-tolerant matching
+        assert _is_prohibited_hash(f"  {canary_secret}  \n", test_blocklist) is True
+
+        # Non-matching strings return False
+        assert _is_prohibited_hash("different-unblocked-secret-value", test_blocklist) is False
+        # Empty or None values fail closed (treated as prohibited)
+        assert _is_prohibited_hash("", test_blocklist) is True
+        assert _is_prohibited_hash(None, test_blocklist) is True
+
+        # Fresh random values must never match the actual settings blocklists
         fresh_secret = secrets.token_urlsafe(50)
         assert len(fresh_secret) >= 32
         assert not _is_prohibited_hash(fresh_secret, _PROHIBITED_SECRET_KEY_HASHES)
@@ -249,3 +266,173 @@ class TestRepositorySanitization:
                 assert h not in all_blocked_hashes, (
                     f"File {rel_path} contains a credential value matching prohibited hash {h}"
                 )
+
+
+@pytest.mark.django_db
+class TestKeyRotationSafeguardsAndReencryption:
+    def test_count_jobs_dependent_on_old_keys(self, settings):
+        """Identifies jobs whose encrypted token cannot be decrypted with the primary key alone."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        new_key = Fernet.generate_key().decode('utf-8')
+        settings.FIELD_ENCRYPTION_KEY = f"{new_key},{old_key}"
+        reset_fernet()
+
+        fernet_old = Fernet(old_key.encode('utf-8'))
+        fernet_new = Fernet(new_key.encode('utf-8'))
+
+        # Job 1: encrypted with old key
+        ExtractionJob.objects.create(
+            encrypted_token=fernet_old.encrypt(b"token-under-old-key").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("token-under-old-key"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("token-under-old-key"),
+        )
+        # Job 2: encrypted with new key
+        ExtractionJob.objects.create(
+            encrypted_token=fernet_new.encrypt(b"token-under-new-key").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("token-under-new-key"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("token-under-new-key"),
+        )
+        # Job 3: empty token
+        ExtractionJob.objects.create(
+            encrypted_token="",
+            token_hash="hash3",
+            dedup_hash="dedup3",
+        )
+
+        # Under new_key alone, exactly 1 job fails decryption
+        assert ExtractionService.count_jobs_dependent_on_old_keys(primary_key=new_key) == 1
+        # Under old_key alone, exactly 1 job fails decryption
+        assert ExtractionService.count_jobs_dependent_on_old_keys(primary_key=old_key) == 1
+
+        reset_fernet()
+
+    def test_reencrypt_all_jobs_migrates_tokens_to_primary_key(self, settings):
+        """Re-encrypts all jobs using MultiFernet fallback, making them decryptable with primary key alone."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        new_key = Fernet.generate_key().decode('utf-8')
+        settings.FIELD_ENCRYPTION_KEY = f"{new_key},{old_key}"
+        reset_fernet()
+
+        fernet_old = Fernet(old_key.encode('utf-8'))
+
+        job = ExtractionJob.objects.create(
+            encrypted_token=fernet_old.encrypt(b"my-api-token").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("my-api-token"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("my-api-token"),
+        )
+
+        assert ExtractionService.count_jobs_dependent_on_old_keys(primary_key=new_key) == 1
+
+        # Perform re-encryption with primary key
+        count = ExtractionService.reencrypt_all_jobs(primary_key=new_key)
+        assert count == 1
+
+        # Now zero jobs depend on old keys
+        assert ExtractionService.count_jobs_dependent_on_old_keys(primary_key=new_key) == 0
+
+        # Verify plaintext token is preserved exactly
+        job.refresh_from_db()
+        assert job.get_decrypted_token() == "my-api-token"
+
+        reset_fernet()
+
+    def test_reencrypt_tokens_management_command(self, settings):
+        """Verifies reencrypt_tokens management command in verify-only and active execution modes."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        new_key = Fernet.generate_key().decode('utf-8')
+        settings.FIELD_ENCRYPTION_KEY = f"{new_key},{old_key}"
+        reset_fernet()
+
+        fernet_old = Fernet(old_key.encode('utf-8'))
+
+        ExtractionJob.objects.create(
+            encrypted_token=fernet_old.encrypt(b"cmd-token").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("cmd-token"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("cmd-token"),
+        )
+
+        out = StringIO()
+        # verify-only exits with error when records depend on old keys
+        with pytest.raises(SystemExit) as exc_info:
+            call_command('reencrypt_tokens', '--verify-only', stdout=out)
+        assert exc_info.value.code == 1
+
+        # Active re-encryption succeeds
+        out = StringIO()
+        call_command('reencrypt_tokens', stdout=out)
+        assert "Successfully re-encrypted and verified 1 job token(s)" in out.getvalue()
+
+        # verify-only now succeeds cleanly
+        out = StringIO()
+        call_command('reencrypt_tokens', '--verify-only', stdout=out)
+        assert "Safe to drop old keys" in out.getvalue()
+
+        reset_fernet()
+
+    def test_rotate_secrets_refuses_to_drop_key_when_records_depend_on_it(self, tmp_path, monkeypatch):
+        """rotate_secrets refuses to drop old key if database records still depend on fallback keys."""
+        env_file = tmp_path / '.env'
+        initial_fernet = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={initial_fernet}\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+        # Mock check_dependent_encrypted_data returning 3 dependent records
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', lambda primary_key=None: 3)
+
+        with pytest.raises(RuntimeError, match=r"Cannot drop old encryption key: 3 stored job\(s\) depend"):
+            rotate_secrets(env_file, keep_old_encryption_key=False)
+
+    def test_rotate_secrets_force_drop_bypasses_safeguard(self, tmp_path, monkeypatch):
+        """--force-drop flag allows dropping old keys despite dependent database records."""
+        env_file = tmp_path / '.env'
+        initial_fernet = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={initial_fernet}\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', lambda primary_key=None: 5)
+
+        result = rotate_secrets(env_file, keep_old_encryption_key=False, force_drop=True)
+        assert "old keys dropped" in result['FIELD_ENCRYPTION_KEY']
+
+    def test_rotate_secrets_reencrypt_flag_reencrypts_before_dropping(self, tmp_path, monkeypatch):
+        """--reencrypt flag re-encrypts dependent data before dropping old keys."""
+        env_file = tmp_path / '.env'
+        initial_fernet = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={initial_fernet}\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        reencrypt_called = []
+        checks = [2, 0]  # Initially 2 dependent, then 0 after re-encryption
+
+        def mock_check(primary_key=None):
+            return checks.pop(0) if checks else 0
+
+        def mock_reencrypt(primary_key=None):
+            reencrypt_called.append(True)
+            return 2
+
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', mock_check)
+        monkeypatch.setattr('scripts.rotate_secrets.reencrypt_stored_data', mock_reencrypt)
+
+        result = rotate_secrets(env_file, keep_old_encryption_key=False, reencrypt=True)
+        assert reencrypt_called == [True]
+        assert "old keys dropped" in result['FIELD_ENCRYPTION_KEY']
+
+    def test_rotate_secrets_prune_old_keys(self, tmp_path, monkeypatch):
+        """--prune-old-keys retains primary key and drops fallback keys without generating a new key."""
+        env_file = tmp_path / '.env'
+        key1 = Fernet.generate_key().decode('utf-8')
+        key2 = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={key1},{key2}\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', lambda primary_key=None: 0)
+
+        result = rotate_secrets(env_file, prune_old_keys_only=True)
+        assert "retained primary key" in result['FIELD_ENCRYPTION_KEY']
+
+        updated_content = env_file.read_text(encoding='utf-8')
+        assert f"FIELD_ENCRYPTION_KEY={key1}\n" in updated_content
+        assert key2 not in updated_content
+

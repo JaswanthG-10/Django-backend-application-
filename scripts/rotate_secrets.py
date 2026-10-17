@@ -35,9 +35,45 @@ def is_tracked_by_git(filepath: Path) -> bool:
         return False
 
 
+def check_dependent_encrypted_data(primary_key: str | None = None) -> int:
+    """Checks whether any stored database records depend on older encryption keys.
+    
+    Returns 0 if no records depend on old keys, or if Django/database is unavailable.
+    """
+    try:
+        import os
+
+        import django
+
+        os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+        django.setup()
+        from apps.extraction.services import ExtractionService
+        return ExtractionService.count_jobs_dependent_on_old_keys(primary_key=primary_key)
+    except Exception:  # noqa: BLE001  # Safe fallback if database or Django environment is unavailable
+        return 0
+
+
+def reencrypt_stored_data(primary_key: str | None = None) -> int:
+    """Re-encrypts all stored database records with the specified primary key.
+    
+    Returns the number of successfully re-encrypted jobs.
+    """
+    import os
+
+    import django
+
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
+    django.setup()
+    from apps.extraction.services import ExtractionService
+    return ExtractionService.reencrypt_all_jobs(primary_key=primary_key)
+
+
 def rotate_secrets(
     env_path: Path,
     keep_old_encryption_key: bool = True,
+    force_drop: bool = False,
+    reencrypt: bool = False,
+    prune_old_keys_only: bool = False,
 ) -> dict[str, str]:
     """Rotates SECRET_KEY, API_KEY_SECRET, and FIELD_ENCRYPTION_KEY in the specified .env file.
     
@@ -71,29 +107,60 @@ def rotate_secrets(
     else:
         backup_msg = "Target file did not exist; creating fresh .env"
 
-    # Generate fresh cryptographic credentials
-    new_secret_key = secrets.token_urlsafe(50)
-    new_api_key_secret = secrets.token_urlsafe(32)
-    new_fernet_key = Fernet.generate_key().decode('utf-8')
+    new_values: dict[str, str] = {}
 
-    # Compute rotated FIELD_ENCRYPTION_KEY value
-    if keep_old_encryption_key and old_field_encryption_key:
-        old_keys = [k.strip() for k in old_field_encryption_key.split(',') if k.strip()]
-        # Preserve old keys with newest primary key first
-        combined_keys = [new_fernet_key] + [k for k in old_keys if k != new_fernet_key]
-        final_encryption_val = ','.join(combined_keys)
-        preserved_count = len(combined_keys) - 1
-        fernet_summary = f"Rotated FIELD_ENCRYPTION_KEY (new primary, preserved {preserved_count} old key{'s' if preserved_count != 1 else ''})"
+    if prune_old_keys_only:
+        if not old_field_encryption_key:
+            raise ValueError("No FIELD_ENCRYPTION_KEY found in target file to prune.")
+        primary_key = old_field_encryption_key.split(',')[0].strip()
+        dep_count = check_dependent_encrypted_data(primary_key=primary_key)
+        if dep_count > 0:
+            if reencrypt:
+                reencrypt_stored_data(primary_key=primary_key)
+                dep_count = check_dependent_encrypted_data(primary_key=primary_key)
+            if dep_count > 0 and not force_drop:
+                raise RuntimeError(
+                    f"Cannot drop old encryption keys: {dep_count} stored job(s) depend on fallback keys. "
+                    f"Re-encrypt records first using 'python manage.py reencrypt_tokens' or pass '--reencrypt', "
+                    f"or override with '--force-drop'."
+                )
+        new_values['FIELD_ENCRYPTION_KEY'] = primary_key
+        fernet_summary = "Pruned FIELD_ENCRYPTION_KEY (retained primary key, dropped old fallback keys)"
     else:
-        final_encryption_val = new_fernet_key
-        fernet_summary = "Rotated FIELD_ENCRYPTION_KEY (primary key replaced, old keys dropped)"
+        # Generate fresh cryptographic credentials
+        new_secret_key = secrets.token_urlsafe(50)
+        new_api_key_secret = secrets.token_urlsafe(32)
+        new_fernet_key = Fernet.generate_key().decode('utf-8')
 
-    # Build updated file content preserving line order and non-target variables
-    new_values = {
-        'SECRET_KEY': new_secret_key,
-        'API_KEY_SECRET': new_api_key_secret,
-        'FIELD_ENCRYPTION_KEY': final_encryption_val,
-    }
+        # Compute rotated FIELD_ENCRYPTION_KEY value
+        if keep_old_encryption_key and old_field_encryption_key:
+            old_keys = [k.strip() for k in old_field_encryption_key.split(',') if k.strip()]
+            # Preserve old keys with newest primary key first
+            combined_keys = [new_fernet_key] + [k for k in old_keys if k != new_fernet_key]
+            final_encryption_val = ','.join(combined_keys)
+            preserved_count = len(combined_keys) - 1
+            fernet_summary = f"Rotated FIELD_ENCRYPTION_KEY (new primary, preserved {preserved_count} old key{'s' if preserved_count != 1 else ''})"
+        else:
+            if old_field_encryption_key:
+                dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
+                if dep_count > 0:
+                    if reencrypt:
+                        reencrypt_stored_data(primary_key=new_fernet_key)
+                        dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
+                    if dep_count > 0 and not force_drop:
+                        raise RuntimeError(
+                            f"Cannot drop old encryption key: {dep_count} stored job(s) depend on fallback keys. "
+                            f"Re-encrypt records first using 'python manage.py reencrypt_tokens' or pass '--reencrypt', "
+                            f"or override with '--force-drop'."
+                        )
+            final_encryption_val = new_fernet_key
+            fernet_summary = "Rotated FIELD_ENCRYPTION_KEY (primary key replaced, old keys dropped)"
+
+        new_values = {
+            'SECRET_KEY': new_secret_key,
+            'API_KEY_SECRET': new_api_key_secret,
+            'FIELD_ENCRYPTION_KEY': final_encryption_val,
+        }
 
     found_keys: set[str] = set()
     output_lines: list[str] = []
@@ -122,12 +189,16 @@ def rotate_secrets(
     # Write securely directly to disk
     target.write_text(''.join(output_lines), encoding='utf-8')
 
-    return {
+    result = {
         'backup': backup_msg,
-        'SECRET_KEY': 'Rotated SECRET_KEY',
-        'API_KEY_SECRET': 'Rotated API_KEY_SECRET',
         'FIELD_ENCRYPTION_KEY': fernet_summary,
     }
+    if 'SECRET_KEY' in new_values:
+        result['SECRET_KEY'] = 'Rotated SECRET_KEY'
+    if 'API_KEY_SECRET' in new_values:
+        result['API_KEY_SECRET'] = 'Rotated API_KEY_SECRET'
+
+    return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -152,13 +223,34 @@ def main(argv: list[str] | None = None) -> int:
         default=True,
         help="Keep previous encryption keys for backwards-compatible decryption (default: True)."
     )
+    parser.add_argument(
+        '--reencrypt',
+        action='store_true',
+        help="Re-encrypt existing database records with the primary key before dropping old keys."
+    )
+    parser.add_argument(
+        '--force-drop',
+        action='store_true',
+        help="Force dropping old encryption keys even if existing database records depend on them."
+    )
+    parser.add_argument(
+        '--prune-old-keys',
+        action='store_true',
+        help="Drop old fallback encryption keys while keeping current primary key without generating a new key."
+    )
 
     args = parser.parse_args(argv)
 
     keep_old = not args.drop_old_encryption_key
 
     try:
-        results = rotate_secrets(args.env_file, keep_old_encryption_key=keep_old)
+        results = rotate_secrets(
+            args.env_file,
+            keep_old_encryption_key=keep_old,
+            force_drop=args.force_drop,
+            reencrypt=args.reencrypt,
+            prune_old_keys_only=args.prune_old_keys,
+        )
         for summary in results.values():
             print(summary)
 
@@ -171,8 +263,10 @@ def main(argv: list[str] | None = None) -> int:
         print("       developer portals (e.g., HubSpot CRM, Salesforce).")
         print("[ ] 3. Webhooks & Signing Keys: Re-generate and configure webhook HMAC signing secrets in provider consoles.")
         print("[ ] 4. Restart backend application services to apply updated environment variables.")
-        print("[ ] 5. Post-migration: Once existing database records have been re-encrypted with the new primary key,")
-        print("       run: python scripts/rotate_secrets.py --drop-old-encryption-key")
+        print("[ ] 5. Re-encryption: Once services are restarted, re-encrypt stored records with:")
+        print("       python manage.py reencrypt_tokens")
+        print("[ ] 6. Post-migration: Once verified, prune old fallback keys from rotation with:")
+        print("       python scripts/rotate_secrets.py --prune-old-keys")
         print("=" * 80)
         return 0
     except (ValueError, RuntimeError, OSError) as err:

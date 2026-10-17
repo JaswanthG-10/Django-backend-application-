@@ -541,3 +541,76 @@ class ExtractionService:
                     }
                 )
             raise
+
+    @classmethod
+    def count_jobs_dependent_on_old_keys(cls, primary_key: str | None = None) -> int:
+        """Counts how many active/stored jobs have encrypted tokens that cannot be decrypted using primary_key alone.
+        
+        Args:
+            primary_key: Optional 32-byte Fernet key string to test against. If omitted,
+                         uses the first key configured in settings.FIELD_ENCRYPTION_KEY.
+        
+        Returns:
+            Number of jobs whose tokens fail decryption under primary_key alone.
+        """
+        from cryptography.fernet import Fernet, InvalidToken
+        target_key = primary_key or getattr(settings, 'FIELD_ENCRYPTION_KEY', None)
+        if not target_key:
+            return 0
+        if isinstance(target_key, str) and ',' in target_key:
+            target_key = target_key.split(',')[0].strip()
+
+        try:
+            fernet = Fernet(target_key.encode('utf-8') if isinstance(target_key, str) else target_key)
+        except (ValueError, TypeError):
+            return 0
+
+        dependent_count = 0
+        for job in ExtractionJob.objects.exclude(encrypted_token=''):
+            try:
+                fernet.decrypt(job.encrypted_token.encode('utf-8'))
+            except (InvalidToken, ValueError, TypeError):
+                dependent_count += 1
+
+        return dependent_count
+
+    @classmethod
+    @transaction.atomic
+    def reencrypt_all_jobs(cls, primary_key: str | None = None) -> int:
+        """Re-encrypts all active extraction jobs using the current primary encryption key.
+        
+        Uses the active MultiFernet instance (which can decrypt using any valid fallback key),
+        then re-encrypts the token with the primary key.
+        Verifies that each re-encrypted token successfully decrypts with primary_key alone.
+        
+        Returns:
+            Number of successfully re-encrypted jobs.
+        """
+        from cryptography.fernet import Fernet
+        target_key = primary_key or getattr(settings, 'FIELD_ENCRYPTION_KEY', None)
+        if isinstance(target_key, str) and ',' in target_key:
+            target_key = target_key.split(',')[0].strip()
+
+        fernet_primary = Fernet(target_key.encode('utf-8') if isinstance(target_key, str) else target_key) if target_key else None
+
+        reencrypted_count = 0
+        jobs_to_update = list(ExtractionJob.objects.exclude(encrypted_token=''))
+        for job in jobs_to_update:
+            token = job.get_decrypted_token()
+            if not token:
+                logger.warning("Skipping job %s: unable to decrypt stored token with existing keys.", job.id)
+                continue
+            if fernet_primary:
+                job.encrypted_token = fernet_primary.encrypt(token.encode('utf-8')).decode('utf-8')
+            else:
+                job.set_encrypted_token(token)
+            job.save(update_fields=['encrypted_token'])
+
+            # Verify immediately that the new ciphertext decrypts with primary key alone
+            if fernet_primary:
+                fernet_primary.decrypt(job.encrypted_token.encode('utf-8'))
+
+            reencrypted_count += 1
+
+        logger.info("Successfully re-encrypted %d job token(s) with primary encryption key.", reencrypted_count)
+        return reencrypted_count
