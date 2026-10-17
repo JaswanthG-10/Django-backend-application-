@@ -233,7 +233,7 @@ class ThirdPartyExtractionClient:
             except requests.exceptions.Timeout as exc:
                 server_attempts += 1
                 if server_attempts <= self.max_retries:
-                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
+                    jitter = random.uniform(0.05, 0.15)
                     delay = backoff_delay + jitter
                     logger.warning(
                         "Request timed out on server attempt %d/%d; retrying in %.2fs | url=%s",
@@ -286,7 +286,7 @@ class ThirdPartyExtractionClient:
                     wait_time = parsed_delay
                 else:
                     # Missing/malformed Retry-After: fall back to exponential backoff with jitter
-                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
+                    jitter = random.uniform(0.05, 0.15)
                     wait_time = backoff_delay + jitter
                     backoff_delay *= 2
 
@@ -320,7 +320,7 @@ class ThirdPartyExtractionClient:
             if status_code >= 500:
                 server_attempts += 1
                 if server_attempts <= self.max_retries:
-                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
+                    jitter = random.uniform(0.05, 0.15)
                     delay = backoff_delay + jitter
                     logger.warning(
                         "Hit HTTP %d on attempt %d/%d; retrying in %.2fs | url=%s",
