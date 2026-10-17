@@ -72,6 +72,12 @@ class RateLimitExceededError(BaseDomainException):
     default_detail = 'Rate limit exceeded for extraction requests. Please retry later.'
 
 
+class PageLimitExceededError(BaseDomainException):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    default_code = 'PAGE_LIMIT_EXCEEDED'
+    default_detail = 'External provider data extraction exceeded the maximum safety page limit.'
+
+
 def custom_exception_handler(exc, context):
     """Custom exception handler guaranteeing consistent error response format across the API.
     

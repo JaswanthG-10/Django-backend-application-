@@ -52,6 +52,7 @@ class JobStatusResponseSerializer(serializers.ModelSerializer):
     job_id = serializers.UUIDField(source='id', read_only=True)
     duration_seconds = serializers.FloatField(read_only=True)
     progress_percentage = serializers.IntegerField(read_only=True)
+    truncated = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = ExtractionJob
@@ -67,6 +68,7 @@ class JobStatusResponseSerializer(serializers.ModelSerializer):
             'end_time',
             'duration_seconds',
             'progress_percentage',
+            'truncated',
             'error_message',
             'error_details',
             'metadata',

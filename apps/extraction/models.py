@@ -210,6 +210,13 @@ class ExtractionJob(models.Model):
         return None
 
     @property
+    def truncated(self) -> bool:
+        """Returns True if the extraction job data was truncated due to page limits or cycle detection."""
+        if isinstance(self.metadata, dict):
+            return bool(self.metadata.get('truncated', False))
+        return False
+
+    @property
     def progress_percentage(self) -> int:
         """Computes approximate progress percentage based on lifecycle state."""
         if self.status == JobStatus.PENDING:
@@ -230,7 +237,8 @@ class ExtractionJob(models.Model):
         target_status: str,
         error_message: str | None = None,
         error_details: dict | None = None,
-        record_count: int | None = None
+        record_count: int | None = None,
+        metadata: dict | None = None,
     ) -> None:
         """Applies a verified state transition or raises InvalidStateTransitionError."""
         if not self.can_transition_to(target_status):
@@ -266,6 +274,9 @@ class ExtractionJob(models.Model):
             self.error_details = error_details
         if record_count is not None:
             self.record_count = record_count
+        if metadata is not None:
+            self.metadata = metadata
+            update_fields.append('metadata')
 
         self.save(update_fields=update_fields)
 
