@@ -5,9 +5,10 @@ Generated for GreenTree / Springer Capital backend development practical assignm
 import sys
 import urllib.parse
 from pathlib import Path
-from django.core.exceptions import ImproperlyConfigured
-from decouple import config, Csv
+
 import dj_database_url
+from decouple import Csv, config
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -241,12 +242,11 @@ _PROHIBITED_PROD_API_KEYS = {
     'cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28',
 }
 API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG else '')
-if not DEBUG:
-    if not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_KEYS:
-        raise ImproperlyConfigured(
-            "A unique, production-grade API_KEY_SECRET must be configured when running with DEBUG=False. "
-            "Shared development credentials and placeholder keys are strictly prohibited in production."
-        )
+if not DEBUG and (not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_KEYS):
+    raise ImproperlyConfigured(
+        "A unique, production-grade API_KEY_SECRET must be configured when running with DEBUG=False. "
+        "Shared development credentials and placeholder keys are strictly prohibited in production."
+    )
 
 # Request Signing Security (HMAC-SHA256 Payload & Timestamp Verification)
 API_REQUIRE_REQUEST_SIGNING = config('API_REQUIRE_REQUEST_SIGNING', default=False, cast=bool)
@@ -303,12 +303,12 @@ if not DEBUG:
     SECURE_BROWSER_XSS_FILTER = True
     SECURE_CONTENT_TYPE_NOSNIFF = True
     X_FRAME_OPTIONS = 'DENY'
-    SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=True, cast=bool)
-    CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=True, cast=bool)
-    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=False, cast=bool)
+    SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=True, cast=parse_bool)
+    CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=True, cast=parse_bool)
+    SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=True, cast=parse_bool)
     SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
-    SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=parse_bool)
+    SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=parse_bool)
 
 # Logging Configuration
 LOG_LEVEL = config('LOG_LEVEL', default='INFO')
