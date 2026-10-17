@@ -19,6 +19,7 @@ from rest_framework import status
 
 from apps.common.exceptions import (
     ExternalServiceError,
+    PageLimitExceededError,
     RateLimitExceededError,
     ResourceNotFoundError,
 )
@@ -394,7 +395,8 @@ class TestConfigurableDataSourceAndPagination:
         mock_get.side_effect = [resp_page1, resp_page2]
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="hubspot-pat-test-token", source_type="contacts")
+        result = client.extract_data(api_token="hubspot-pat-test-token", source_type="contacts")
+        records = result.records
 
         assert len(records) == 3
         assert mock_get.call_count == 2
@@ -512,9 +514,11 @@ class TestCompletePaginationAndRealAPI:
         mock_get.side_effect = mock_pages
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="test-token", source_type="contacts", page_size=20)
+        result = client.extract_data(api_token="test-token", source_type="contacts", page_size=20)
+        records = result.records
 
         assert len(records) == 140
+        assert not result.truncated
         assert mock_get.call_count == 7
         # Verify pagination continued past the legacy 5-page / 100-record limit
         assert any(r['id_from_service'] == 'rec_7_19' for r in records)
@@ -533,8 +537,10 @@ class TestCompletePaginationAndRealAPI:
         mock_get.side_effect = [resp1, resp2]
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="test-token", source_type="contacts")
+        result = client.extract_data(api_token="test-token", source_type="contacts")
+        records = result.records
         assert len(records) == 1
+        assert not result.truncated
         assert mock_get.call_count == 2
 
     @patch('requests.Session.get')
@@ -563,7 +569,8 @@ class TestCompletePaginationAndRealAPI:
         mock_get.side_effect = [resp1, resp2]
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="test-token", source_type="contacts")
+        result = client.extract_data(api_token="test-token", source_type="contacts")
+        records = result.records
         assert len(records) == 3
         ids = [r['id_from_service'] for r in records]
         assert ids == ['dup_1', 'dup_2', 'dup_3']
@@ -588,9 +595,11 @@ class TestCompletePaginationAndRealAPI:
         mock_get.side_effect = [resp1, resp2]
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="test-token", source_type="contacts")
-        # Must terminate without infinite loop
+        result = client.extract_data(api_token="test-token", source_type="contacts", on_page_limit='truncate')
+        records = result.records
+        # Must terminate without infinite loop and report truncated
         assert len(records) == 2
+        assert result.truncated is True
         assert mock_get.call_count == 2
 
 
@@ -836,7 +845,8 @@ class TestHttp429RetryAfterHandling:
         mock_get.side_effect = [resp_429, resp_200]
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        records = client.extract_data(api_token="test-token", source_type="contacts")
+        result = client.extract_data(api_token="test-token", source_type="contacts")
+        records = result.records
 
         assert len(records) == 1
         assert mock_get.call_count == 2
@@ -943,3 +953,253 @@ class TestHttp429RetryAfterHandling:
         # 404 must not sleep or retry
         assert mock_get.call_count == 1
         mock_sleep.assert_not_called()
+
+
+@pytest.mark.django_db
+class TestPageCapAndRateLimitBudgets:
+    """Tests for page cap policies, 429 retry budgets, heartbeat chunking, and environment setup."""
+
+    @patch('requests.Session.get')
+    def test_page_cap_reached_with_fail_fails_job_with_page_limit_exceeded(self, mock_get):
+        """1. Page cap reached with fail: job FAILED with PAGE_LIMIT_EXCEEDED, no records presented as complete."""
+        def mock_page_response(*args, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                'results': [{'id': f'rec_{time.time()}_{i}', 'properties': {'email': f'user_{i}@test.com'}} for i in range(10)],
+                'paging': {'next': {'after': f'cursor_{time.time()}'}}
+            }
+            return resp
+
+        mock_get.side_effect = mock_page_response
+
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CONTACTS,
+            token_hash="hash-fail-cap",
+            status=JobStatus.PENDING
+        )
+        job.set_encrypted_token("test-fail-token")
+        job.save()
+
+        with override_settings(
+            EXTERNAL_API_ON_PAGE_LIMIT='fail',
+            EXTERNAL_API_MAX_PAGES=3,
+            EXTERNAL_API_PAGE_SIZE=10
+        ):
+            service = ExtractionService()
+            with pytest.raises(PageLimitExceededError):
+                service.process_extraction(job_id=job.id)
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.FAILED
+        assert job.error_details.get('code') == 'PAGE_LIMIT_EXCEEDED'
+        assert "exceeded" in job.error_message.lower()
+        # Verify no records were presented as complete or persisted
+        assert ExtractedRecord.objects.filter(job=job).count() == 0
+        assert job.record_count == 0
+
+    @patch('requests.Session.get')
+    def test_page_cap_reached_with_truncate_completes_job_with_truncated_metadata(self, mock_get, api_client):
+        """2. Page cap reached with truncate: job COMPLETED, truncated=true visible in status endpoint."""
+        page_counter = 0
+
+        def mock_page_response(*args, **kwargs):
+            nonlocal page_counter
+            page_counter += 1
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {
+                'results': [{'id': f'rec_p{page_counter}_{i}', 'properties': {'email': f'user{page_counter}_{i}@test.com'}} for i in range(10)],
+                'paging': {'next': {'after': f'cursor_{page_counter}'}}
+            }
+            return resp
+
+        mock_get.side_effect = mock_page_response
+
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CONTACTS,
+            token_hash="hash-trunc-cap",
+            status=JobStatus.PENDING
+        )
+        job.set_encrypted_token("test-trunc-token")
+        job.save()
+
+        with override_settings(
+            EXTERNAL_API_ON_PAGE_LIMIT='truncate',
+            EXTERNAL_API_MAX_PAGES=3,
+            EXTERNAL_API_PAGE_SIZE=10
+        ):
+            service = ExtractionService()
+            completed_job = service.process_extraction(job_id=job.id)
+
+        completed_job.refresh_from_db()
+        assert completed_job.status == JobStatus.COMPLETED
+        assert completed_job.record_count == 30
+        assert completed_job.metadata.get('truncated') is True
+        assert completed_job.truncated is True
+        assert ExtractedRecord.objects.filter(job=completed_job).count() == 30
+
+        # Verify status endpoint exposes truncated=True and record_count
+        url = reverse('extraction:scan-status', kwargs={'job_id': completed_job.id})
+        response = api_client.get(url)
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert data['status'] == 'completed'
+        assert data['truncated'] is True
+        assert data['record_count'] == 30
+
+    @patch('requests.Session.get')
+    def test_more_than_1000_records_fetched_across_pages_with_default_page_size(self, mock_get):
+        """3. More than 1,000 records across many pages are fully fetched with new default page size."""
+        # 11 pages of 100 records = 1100 records
+        mock_pages = []
+        for p in range(1, 12):
+            resp = MagicMock()
+            resp.status_code = 200
+            items = [{'id': f'rec_{p}_{i}', 'properties': {'email': f'u_{p}_{i}@crm.com'}} for i in range(100)]
+            if p < 11:
+                resp.json.return_value = {
+                    'results': items,
+                    'paging': {'next': {'after': f'cursor_{p+1}'}}
+                }
+            else:
+                resp.json.return_value = {
+                    'results': items,
+                    'paging': {}
+                }
+            mock_pages.append(resp)
+
+        mock_get.side_effect = mock_pages
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        result = client.extract_data(api_token="test-large-import-token", source_type="contacts")
+        records = result.records
+
+        assert len(records) == 1100
+        assert not result.truncated
+        assert mock_get.call_count == 11
+        # Verify page_size defaulted to 100
+        for call_item in mock_get.call_args_list:
+            params = call_item[1]['params']
+            assert params['limit'] == 100
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_five_consecutive_429s_succeed_on_sixth_without_consuming_5xx_budget_and_sixth_fails(
+        self, mock_get, mock_sleep
+    ):
+        """4. Five consecutive 429s with valid Retry-After succeed on 6th call and do not consume 5xx budget; a 6th fails."""
+        # Part A: 5 consecutive 429s, then 200 on 6th call succeeds
+        resp_429 = MagicMock(status_code=429, headers={'Retry-After': '1'})
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {'results': [{'id': 'rec_429_ok', 'properties': {'email': 'ok@crm.com'}}], 'paging': {}}
+
+        mock_get.side_effect = [resp_429, resp_429, resp_429, resp_429, resp_429, resp_200]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com", max_retries=3)
+        with override_settings(EXTERNAL_API_MAX_RATE_LIMIT_RETRIES=5):
+            result = client.extract_data(api_token="test-token-429", source_type="contacts")
+
+        assert len(result.records) == 1
+        assert result.records[0]['id_from_service'] == 'rec_429_ok'
+        assert mock_get.call_count == 6
+        assert mock_sleep.call_count == 5
+
+        # Part B: 6th consecutive 429 fails cleanly with RateLimitExceededError and no token in message/details
+        mock_sleep.reset_mock()
+        mock_get.reset_mock()
+        mock_get.side_effect = [resp_429, resp_429, resp_429, resp_429, resp_429, resp_429]
+
+        with override_settings(EXTERNAL_API_MAX_RATE_LIMIT_RETRIES=5), pytest.raises(RateLimitExceededError) as exc_info:
+            client.extract_data(api_token="sensitive-token-9988", source_type="contacts")
+
+        assert exc_info.value.status_code == 429
+        # Verify sensitive token is NEVER leaked in error message or details
+        assert "sensitive-token-9988" not in str(exc_info.value.message)
+        assert "sensitive-token-9988" not in str(exc_info.value.details)
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_total_429_wait_ceiling_is_enforced(self, mock_get, mock_sleep):
+        """5. Total 429 wait ceiling is enforced: fails safely when cumulative wait exceeds ceiling."""
+        resp_429_20s = MagicMock(status_code=429, headers={'Retry-After': '20'})
+        mock_get.return_value = resp_429_20s
+
+        # Ceiling: 50 seconds total wait. Each wait is 20s.
+        # Wait 1: 20s (total: 20s <= 50s)
+        # Wait 2: 20s (total: 40s <= 50s)
+        # Wait 3: 20s (total: 60s > 50s) -> Must fail immediately before 3rd sleep
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        with override_settings(
+            EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS=50.0,
+            EXTERNAL_API_MAX_RETRY_AFTER_SECONDS=30.0,
+            EXTERNAL_API_MAX_RATE_LIMIT_RETRIES=5
+        ), pytest.raises(RateLimitExceededError) as exc_info:
+            client.extract_data(api_token="test-token", source_type="contacts")
+
+        assert exc_info.value.status_code == 429
+        assert "exceeded ceiling of 50.0s" in exc_info.value.message
+        assert mock_sleep.call_count == 2
+        # Slept exactly 20.0s twice
+        assert mock_sleep.call_args_list[0][0][0] == 20.0
+        assert mock_sleep.call_args_list[1][0][0] == 20.0
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_heartbeat_callback_invoked_during_long_retry_after_wait(self, mock_get, mock_sleep):
+        """6. Heartbeat callback is invoked in chunks during a long Retry-After wait."""
+        # Delay of 75 seconds with 30s chunk size -> 2 chunk boundaries (30s, 30s, 15s)
+        resp_429 = MagicMock(status_code=429, headers={'Retry-After': '75'})
+        resp_200 = MagicMock(status_code=200)
+        resp_200.json.return_value = {'results': [], 'paging': {}}
+
+        mock_get.side_effect = [resp_429, resp_200]
+
+        mock_hb = MagicMock()
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        with override_settings(
+            EXTERNAL_API_MAX_RETRY_AFTER_SECONDS=100.0,
+            EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS=300.0,
+            EXTRACTION_HEARTBEAT_CHUNK_SECONDS=30.0
+        ):
+            client.extract_data(
+                api_token="test-token",
+                source_type="contacts",
+                heartbeat_callback=mock_hb
+            )
+
+        # Total wait was 75s: 30s + 30s + 15s
+        assert mock_sleep.call_count == 3
+        # Heartbeat callback was invoked during sleep between chunks
+        assert mock_hb.call_count >= 2
+
+    def test_starting_with_env_example_loads_cleanly(self):
+        """7. Settings: starting with the new .env.example copied to .env loads without ImproperlyConfigured."""
+        from decouple import Config, RepositoryEnv
+        env_example_path = settings.BASE_DIR / '.env.example'
+        assert env_example_path.exists()
+
+        example_config = Config(RepositoryEnv(str(env_example_path)))
+        parsed_debug = example_config('DEBUG', cast=parse_bool)
+        assert parsed_debug is True
+
+        parsed_db = example_config('DATABASE_URL')
+        assert parsed_db.startswith('sqlite')
+
+        parsed_secret = example_config('SECRET_KEY')
+        assert bool(parsed_secret)
+
+        parsed_api_key = example_config('API_KEY_SECRET')
+        assert bool(parsed_api_key)
+
+        parsed_fernet = example_config('FIELD_ENCRYPTION_KEY')
+        assert bool(parsed_fernet)
+        from cryptography.fernet import Fernet
+        Fernet(parsed_fernet.encode('utf-8'))
+
+        assert example_config('EXTERNAL_API_PAGE_SIZE', cast=int) == 100
+        assert example_config('EXTERNAL_API_MAX_PAGES', cast=int) == 2000
+        assert example_config('EXTERNAL_API_ON_PAGE_LIMIT') == 'fail'
+        assert example_config('EXTERNAL_API_MAX_RATE_LIMIT_RETRIES', cast=int) == 5
+        assert example_config('EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS', cast=float) == 300.0
+

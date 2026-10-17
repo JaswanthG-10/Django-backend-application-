@@ -35,9 +35,11 @@ class TestThirdPartyExtractionClient:
         mock_session.get.return_value = mock_response
         client.session = mock_session
 
-        records = client.extract_data(api_token="valid-token-123", source_type="crm")
+        result = client.extract_data(api_token="valid-token-123", source_type="crm")
+        records = result.records
 
         assert len(records) == 1
+        assert not result.truncated
         assert records[0]["id"] == "c1"
         assert records[0]["id_from_service"] == "c1"
         assert mock_session.get.call_count == 1
@@ -96,7 +98,8 @@ class TestThirdPartyExtractionClient:
         mock_session.get.side_effect = [resp_429, resp_200]
         client.session = mock_session
 
-        records = client.extract_data(api_token="valid-token", source_type="crm")
+        result = client.extract_data(api_token="valid-token", source_type="crm")
+        records = result.records
         assert len(records) == 1
         assert records[0]['id_from_service'] == 'rec_ok'
         assert mock_session.get.call_count == 2
@@ -141,7 +144,8 @@ class TestThirdPartyExtractionClient:
         mock_session.get.side_effect = [page1, page2]
         client.session = mock_session
 
-        records = client.extract_data(api_token="valid-token", source_type="crm", page_size=20, max_pages=3)
+        result = client.extract_data(api_token="valid-token", source_type="crm", page_size=20, max_pages=3)
+        records = result.records
         assert len(records) == 25
         assert mock_session.get.call_count == 2
 
@@ -159,7 +163,8 @@ class TestThirdPartyExtractionClient:
         mock_session.get.return_value = mock_response
         demo_client.session = mock_session
 
-        records = demo_client.extract_data(api_token="sensitive-customer-secret-token", source_type="users")
+        result = demo_client.extract_data(api_token="sensitive-customer-secret-token", source_type="users")
+        records = result.records
         assert len(records) == 1
         call_args, call_kwargs = mock_session.get.call_args
         assert call_args[0] == "https://jsonplaceholder.typicode.com/users"
