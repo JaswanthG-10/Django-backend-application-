@@ -3,16 +3,16 @@ import base64
 import hashlib
 import logging
 
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 
 logger = logging.getLogger('apps.common.encryption')
 
-_fernet_instance: Fernet | None = None
+_fernet_instance: Fernet | MultiFernet | None = None
 
 
-def get_fernet():
+def get_fernet() -> Fernet | MultiFernet:
     """Returns a cached Fernet or MultiFernet cipher instance using FIELD_ENCRYPTION_KEY.
     
     Supports key rotation via comma-separated keys: encryption uses the primary (first) key,
@@ -33,8 +33,6 @@ def get_fernet():
         return _fernet_instance
 
     try:
-        from cryptography.fernet import MultiFernet
-
         # Support comma-separated key rotation: primary_key,fallback_key1,fallback_key2
         if isinstance(raw_key, str) and ',' in raw_key:
             key_list = [k.strip().encode('utf-8') for k in raw_key.split(',') if k.strip()]

@@ -7,7 +7,7 @@ from cryptography.fernet import Fernet
 from django.test import override_settings
 from django.utils import timezone
 
-from apps.common.exceptions import PageLimitExceededError
+from apps.common.exceptions import ExternalServiceError, PageLimitExceededError
 from apps.extraction.clients import ExtractionResult, ThirdPartyExtractionClient
 from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus, SourceType
 from apps.extraction.services import ExtractionService
@@ -276,6 +276,95 @@ class TestPaginationRegressions:
 
         assert len(result.records) == 2
 
+    @pytest.mark.parametrize("target_url", [
+        "http://127.0.0.1:8000/api/v1/health",
+        "http://localhost/records",
+        "http://[::1]/next",
+        "http://0.0.0.0:8000/api",
+        "http://10.0.0.1/data",
+        "http://192.168.1.1/data",
+        "http://172.16.0.1/data",
+        "http://169.254.169.254/latest/meta-data",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "https://service.local/api",
+        "https://server.internal/crm",
+    ])
+    def test_pagination_rejects_loopback_private_and_metadata_targets(self, extraction_client, target_url):
+        """Prevent SSRF: Pagination URLs targeting private, loopback, or cloud metadata endpoints are rejected."""
+        validated = extraction_client._validate_and_normalize_pagination_url(
+            target_url,
+            "https://api.hubapi.com/crm/v3/objects/contacts"
+        )
+        assert validated is None
+
+    def test_pagination_rejects_urls_with_userinfo(self, extraction_client):
+        """Prevent SSRF & Credential Injection: URLs with embedded credentials (user:pass@host) are rejected."""
+        url_with_creds = "https://admin:supersecret@api.hubapi.com/crm/v3/objects/contacts?page=2"
+        validated = extraction_client._validate_and_normalize_pagination_url(
+            url_with_creds,
+            "https://api.hubapi.com/crm/v3/objects/contacts"
+        )
+        assert validated is None
+
+    def test_pagination_redirect_to_private_ip_is_blocked(self, extraction_client):
+        """Prevent Redirect-Based SSRF: Redirect responses pointing to private/metadata IPs are aborted."""
+        resp = MagicMock()
+        resp.is_redirect = True
+        resp.status_code = 302
+        resp.url = "https://api.hubapi.com/crm/v3/objects/contacts"
+        resp.headers = {"Location": "http://169.254.169.254/latest/meta-data/"}
+
+        with pytest.raises(ExternalServiceError) as exc_info:
+            extraction_client._check_redirect_ssrf(resp)
+        assert "Redirect to restricted destination '169.254.169.254' is prohibited." in str(exc_info.value)
+        assert exc_info.value.details.get("reason") == "ssrf_redirect_blocked"
+
+    def test_empty_page_with_valid_next_cursor_continues_to_subsequent_page(self, extraction_client):
+        """An empty page (results: []) that provides an explicit continuation cursor proceeds to fetch the next page."""
+        page1_resp = MagicMock()
+        page1_resp.status_code = 200
+        page1_resp.json.return_value = {
+            "results": [],
+            "paging": {"next": {"after": "cursor_for_page_2"}}
+        }
+
+        page2_resp = MagicMock()
+        page2_resp.status_code = 200
+        page2_resp.json.return_value = {
+            "results": [{"id": "rec_discovered_on_page2", "email": "p2@example.com"}]
+        }
+
+        with patch.object(extraction_client.session, 'get', side_effect=[page1_resp, page2_resp]):
+            result = extraction_client.extract_data(
+                api_token="test-crm-token",
+                source_type="contacts"
+            )
+
+        assert len(result.records) == 1
+        assert result.records[0]["id_from_service"] == "rec_discovered_on_page2"
+        assert result.truncated is False
+
+    def test_self_referencing_next_url_terminates_gracefully_in_truncate_mode(self, extraction_client):
+        """A self-referencing next URL identical to the current page URL terminates cleanly when configured to truncate."""
+        base = "https://api.hubapi.com/crm/v3/objects/contacts"
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.links = {}
+        resp.json.return_value = {
+            "results": [{"id": "rec_loop"}],
+            "next": base  # Self-referencing identical URL
+        }
+
+        with patch.object(extraction_client.session, 'get', return_value=resp):
+            result = extraction_client.extract_data(
+                api_token="test-crm-token",
+                source_type="contacts",
+                on_page_limit="truncate"
+            )
+
+        assert result.truncated is True
+        assert len(result.records) == 1
+
 
 @pytest.mark.django_db
 class TestBackgroundExtractionReliability:
@@ -422,3 +511,75 @@ class TestBackgroundExtractionReliability:
             enc._fernet_instance = None
             decrypted = decrypt_secret(ciphertext)
             assert decrypted == "my-super-secret-provider-token"
+
+    def test_stale_job_with_undecryptable_token_fails_permanently_without_retrying(self):
+        """A stale job whose encrypted token cannot be decrypted (corrupted or rotated without fallback)
+        transitions permanently to FAILED with WORKER_ABANDONED_TIMEOUT instead of spinning in PENDING.
+        """
+        service = ExtractionService()
+        job, _ = service.initiate_job(api_token="test-token-to-corrupt", source_type=SourceType.CRM)
+
+        stale_time = timezone.now() - timezone.timedelta(minutes=30)
+        # Corrupt the encrypted_token in DB
+        ExtractionJob.objects.filter(id=job.id).update(
+            status=JobStatus.IN_PROGRESS,
+            encrypted_token="corrupted-non-fernet-token-data",
+            start_time=stale_time,
+            heartbeat_at=stale_time
+        )
+
+        with patch.object(ExtractionService, 'dispatch_background_extraction') as mock_dispatch:
+            recovered_count = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+            assert recovered_count == 1
+            mock_dispatch.assert_not_called()
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.FAILED
+        assert job.error_details.get("code") == "WORKER_ABANDONED_TIMEOUT"
+        assert "Missing or undecryptable recovery credentials" in job.error_details.get("reason", "")
+
+    @override_settings(EXTRACTION_ASYNC_EXECUTION=True)
+    def test_stale_job_recovery_handles_dispatch_exception_gracefully(self):
+        """If dispatch_background_extraction raises an exception during recovery,
+        the recovery process catches it, logs an error, and does not crash.
+        """
+        service = ExtractionService()
+        job, _ = service.initiate_job(api_token="dispatch-fail-token", source_type=SourceType.CRM)
+
+        stale_time = timezone.now() - timezone.timedelta(minutes=30)
+        ExtractionJob.objects.filter(id=job.id).update(
+            status=JobStatus.IN_PROGRESS,
+            start_time=stale_time,
+            heartbeat_at=stale_time
+        )
+
+        with patch.object(ExtractionService, 'dispatch_background_extraction', side_effect=RuntimeError("ThreadPool exhausted")):
+            recovered_count = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+            assert recovered_count == 1
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+
+    def test_get_fernet_returns_multifernet_and_handles_invalid_tokens(self):
+        """Verify MultiFernet type and InvalidToken handling when decrypting with wrong key."""
+        from cryptography.fernet import MultiFernet
+
+        import apps.common.encryption as enc
+        from apps.common.encryption import decrypt_secret, get_fernet
+
+        k1 = Fernet.generate_key().decode()
+        k2 = Fernet.generate_key().decode()
+        wrong_key = Fernet.generate_key().decode()
+
+        with override_settings(FIELD_ENCRYPTION_KEY=f"{k1},{k2}"):
+            enc._fernet_instance = None
+            cipher = get_fernet()
+            assert isinstance(cipher, MultiFernet)
+
+        # Encrypt with wrong_key, try to decrypt with k1
+        cipher_wrong = Fernet(wrong_key.encode()).encrypt(b"secret payload").decode()
+        with override_settings(FIELD_ENCRYPTION_KEY=k1):
+            enc._fernet_instance = None
+            with pytest.raises(ValueError) as exc_info:
+                decrypt_secret(cipher_wrong)
+            assert "Failed to decrypt stored credential" in str(exc_info.value)

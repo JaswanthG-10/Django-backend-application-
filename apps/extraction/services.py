@@ -60,7 +60,7 @@ class ExtractionService:
         self.client = client or ThirdPartyExtractionClient()
 
     @classmethod
-    def dispatch_background_extraction(cls, job_id: UUID, api_token: str) -> None:
+    def dispatch_background_extraction(cls, job_id: UUID, api_token: str | None = None) -> None:
         """Dispatches extraction to a managed bounded thread pool worker.
         
         Guarantees that the job transitions through pending -> in_progress -> completed (or failed)
@@ -239,7 +239,12 @@ class ExtractionService:
                 job.id, last_activity, minutes, job.retry_count, job.max_retries or max_retries_setting
             )
             try:
-                can_retry = allow_retry and (job.retry_count < (job.max_retries or max_retries_setting)) and bool(job.encrypted_token)
+                decrypted_token = job.get_decrypted_token() if job.encrypted_token else None
+                can_retry = (
+                    allow_retry
+                    and (job.retry_count < (job.max_retries or max_retries_setting))
+                    and bool(decrypted_token)
+                )
                 now = timezone.now()
 
                 if can_retry:
@@ -277,11 +282,17 @@ class ExtractionService:
                         logger.info("Stale job %s safely recovered and re-queued to PENDING (retry %d)", job.id, job.retry_count + 1)
                         recovered_count += 1
                         if getattr(settings, 'EXTRACTION_ASYNC_EXECUTION', True):
-                            token = job.get_decrypted_token()
-                            cls.dispatch_background_extraction(job_id=job.id, api_token=token)
+                            try:
+                                cls.dispatch_background_extraction(job_id=job.id, api_token=decrypted_token)
+                            except Exception as dispatch_exc:  # noqa: BLE001
+                                logger.error("Failed to dispatch recovered job %s: %s", job.id, dispatch_exc)
                 else:
-                    reason = "Max retries exceeded" if job.retry_count >= (job.max_retries or max_retries_setting) else "Missing recovery credentials"
-                    code = 'MAX_RETRIES_EXCEEDED' if 'Max' in reason else 'WORKER_ABANDONED_TIMEOUT'
+                    if job.retry_count >= (job.max_retries or max_retries_setting):
+                        reason = "Max retries exceeded"
+                        code = 'MAX_RETRIES_EXCEEDED'
+                    else:
+                        reason = "Missing or undecryptable recovery credentials"
+                        code = 'WORKER_ABANDONED_TIMEOUT'
                     filter_kwargs = {
                         'id': job.id,
                         'status': JobStatus.IN_PROGRESS,

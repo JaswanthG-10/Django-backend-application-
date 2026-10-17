@@ -1,9 +1,11 @@
 """Client for communicating with external third-party data providers."""
 import datetime
 import email.utils
+import ipaddress
 import logging
 import random
 import re
+import socket
 import time
 import urllib.parse
 from collections.abc import Callable
@@ -195,25 +197,85 @@ class ThirdPartyExtractionClient:
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, norm_path, parsed.query, parsed.fragment))
 
     @staticmethod
+    def _is_private_or_loopback_target(hostname: str) -> bool:
+        """Checks if a hostname is loopback, internal, private, or cloud metadata target.
+
+        Blocks SSRF vectors targeting internal services, cloud metadata endpoints,
+        and private network segments.
+        """
+        if not hostname:
+            return True
+        lowered = hostname.lower().strip()
+
+        # Block well-known loopback and cloud metadata names
+        if lowered in ('localhost', '0.0.0.0', 'metadata.google.internal', 'metadata', 'instance-data'):
+            return True
+        if lowered.endswith(('.localhost', '.local', '.internal', '.localdomain')):
+            return True
+
+        # Check for direct IP address literal
+        try:
+            ip = ipaddress.ip_address(lowered)
+            return (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        except ValueError:
+            pass
+
+        # Try DNS resolution to detect DNS rebinding or private IP mapping
+        try:
+            addr_infos = socket.getaddrinfo(lowered, None, proto=socket.IPPROTO_TCP)
+            for addr_info in addr_infos:
+                ip_str = addr_info[4][0]
+                try:
+                    ip = ipaddress.ip_address(ip_str)
+                    if (
+                        ip.is_private
+                        or ip.is_loopback
+                        or ip.is_link_local
+                        or ip.is_multicast
+                        or ip.is_reserved
+                        or ip.is_unspecified
+                    ):
+                        return True
+                except ValueError:
+                    continue
+        except (socket.gaierror, OSError):
+            # In offline/mock test environments or if unresolvable, do not treat as private IP
+            pass
+
+        return False
+
+    @staticmethod
     def _is_same_provider_host(target_url: str, base_url: str) -> bool:
         """Determines if target URL belongs to the same provider host as base URL.
-        
+
         Protects bearer tokens from being leaked to unintended external hosts during
-        next-page URL pagination.
+        next-page URL pagination. Compares hostnames (without port) to handle
+        port variations within the same provider.
         """
         if not target_url or not base_url:
             return False
-        target_netloc = urllib.parse.urlsplit(target_url).netloc.lower()
-        base_netloc = urllib.parse.urlsplit(base_url).netloc.lower()
-        if not target_netloc:
+        target_parsed = urllib.parse.urlsplit(target_url)
+        base_parsed = urllib.parse.urlsplit(base_url)
+        target_host = target_parsed.hostname or ''
+        base_host = base_parsed.hostname or ''
+        if not target_host:
             # Relative URL - resolves against provider base host
             return True
-        return target_netloc == base_netloc
+        return target_host.lower() == base_host.lower()
 
     def _validate_and_normalize_pagination_url(self, raw_url: str, current_url: str) -> str | None:
-        """Validates and normalizes pagination next URLs.
-        
-        Resolves relative paths, validates schemes, and rejects malformed URLs.
+        """Validates and normalizes pagination next URLs with SSRF protection.
+
+        Resolves relative paths, validates schemes, rejects malformed URLs,
+        blocks private/loopback/link-local/cloud metadata addresses, and rejects URLs
+        containing userinfo (user:pass@host) to prevent credential injection.
         """
         if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
             return None
@@ -226,7 +288,42 @@ class ThirdPartyExtractionClient:
         if not getattr(settings, 'DEBUG', True) and parsed.scheme.lower() != 'https':
             logger.warning("Rejected non-HTTPS pagination URL in production: %s", resolved)
             return None
+        # Block userinfo in URL (e.g. https://user:pass@evil.com) to prevent credential injection
+        if parsed.username or parsed.password:
+            logger.warning("Rejected pagination URL containing userinfo credentials.")
+            return None
+        # Block private/loopback/link-local/reserved IP addresses and metadata endpoints to prevent SSRF
+        hostname = parsed.hostname
+        if not hostname or self._is_private_or_loopback_target(hostname):
+            logger.warning(
+                "Rejected pagination URL targeting private/loopback/reserved destination: %s", hostname
+            )
+            return None
         return resolved
+
+    @classmethod
+    def _check_redirect_ssrf(cls, response: requests.Response, *args: Any, **kwargs: Any) -> requests.Response:
+        """Validates redirect targets to prevent redirect-based SSRF attacks.
+
+        Inspects redirect responses (3xx) before the next hop is requested. If the redirect target
+        points to a private, loopback, link-local, or cloud metadata address, aborts the request.
+        """
+        if response.is_redirect or (300 <= response.status_code < 400):
+            location = response.headers.get('Location')
+            if location:
+                resolved = urllib.parse.urljoin(response.url, location)
+                parsed = urllib.parse.urlsplit(resolved)
+                hostname = parsed.hostname
+                if hostname and cls._is_private_or_loopback_target(hostname):
+                    logger.error(
+                        "Blocked redirect to restricted or loopback destination | location=%s target=%s",
+                        location, resolved
+                    )
+                    raise ExternalServiceError(
+                        message=f"Redirect to restricted destination '{hostname}' is prohibited.",
+                        details={'location': location, 'reason': 'ssrf_redirect_blocked'}
+                    )
+        return response
 
     def _execute_request_with_retries(
         self,
@@ -235,6 +332,7 @@ class ThirdPartyExtractionClient:
         params: dict[str, Any],
         max_retry_after: float | None = None,
         heartbeat_callback: Callable[[], None] | None = None,
+        allow_redirects: bool = True,
     ) -> requests.Response:
         """Executes GET request with separate retry budgets for 429 rate limits and 5xx/timeout errors.
         
@@ -262,7 +360,9 @@ class ThirdPartyExtractionClient:
                     url,
                     headers=headers,
                     params=params,
-                    timeout=self.timeout
+                    timeout=self.timeout,
+                    allow_redirects=allow_redirects,
+                    hooks={'response': [self._check_redirect_ssrf]},
                 )
             except requests.exceptions.Timeout as exc:
                 server_attempts += 1
