@@ -18,6 +18,7 @@ from apps.extraction.tests.factories import (
 def disable_async_extraction_for_unit_tests(settings):
     """Disables background worker threads by default during unit tests for deterministic assertions."""
     settings.EXTRACTION_ASYNC_EXECUTION = False
+    settings.SECURE_SSL_REDIRECT = False
 
 
 @pytest.fixture(autouse=True)

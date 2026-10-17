@@ -1173,11 +1173,15 @@ class TestPageCapAndRateLimitBudgets:
         # Heartbeat callback was invoked during sleep between chunks
         assert mock_hb.call_count >= 2
 
-    def test_starting_with_env_example_loads_cleanly(self):
+    def test_starting_with_env_example_loads_cleanly(self, monkeypatch):
         """7. Settings: starting with the new .env.example copied to .env loads without ImproperlyConfigured."""
         from decouple import Config, RepositoryEnv
         env_example_path = settings.BASE_DIR / '.env.example'
         assert env_example_path.exists()
+
+        # Clear process environment overrides so we verify the file contents themselves
+        for env_key in ('DEBUG', 'DATABASE_URL', 'SECRET_KEY', 'API_KEY_SECRET', 'FIELD_ENCRYPTION_KEY'):
+            monkeypatch.delenv(env_key, raising=False)
 
         example_config = Config(RepositoryEnv(str(env_example_path)))
         parsed_debug = example_config('DEBUG', cast=parse_bool)
