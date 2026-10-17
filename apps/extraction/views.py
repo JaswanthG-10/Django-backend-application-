@@ -356,7 +356,7 @@ class HealthCheckView(APIView):
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - health check probe must catch all connection/driver errors to report unhealthy status
             logger.error("Health check database failure: %s", exc)
             db_status = "unhealthy"
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -419,7 +419,7 @@ class ReadinessHealthCheckView(APIView):
                 'database': 'healthy',
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_200_OK)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - readiness probe must catch all connection/driver errors to report degraded status
             logger.error("Readiness probe database check failed: %s", exc)
             return Response({
                 'status': 'degraded',

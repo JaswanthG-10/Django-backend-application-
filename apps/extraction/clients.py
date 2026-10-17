@@ -46,7 +46,7 @@ def _sleep_with_heartbeat(
         if heartbeat_callback and remaining > 0:
             try:
                 heartbeat_callback()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - heartbeat callback failure must not crash rate limit sleep intervals
                 logger.debug("Heartbeat callback exception ignored during retry sleep: %s", exc)
 
 

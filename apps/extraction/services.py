@@ -80,7 +80,7 @@ class ExtractionService:
                 # Retrieve token from parameter or decrypted storage
                 token = api_token or claimed.get_decrypted_token()
                 service.process_extraction(job_id=job_id, api_token=token, already_claimed=True)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - top-level thread worker catches all errors to prevent unhandled thread crashes
                 logger.warning(
                     "Background extraction task completed with status update for job %s: %s",
                     job_id, exc
@@ -284,7 +284,7 @@ class ExtractionService:
                         if getattr(settings, 'EXTRACTION_ASYNC_EXECUTION', True):
                             try:
                                 cls.dispatch_background_extraction(job_id=job.id, api_token=decrypted_token)
-                            except Exception as dispatch_exc:  # noqa: BLE001
+                            except Exception as dispatch_exc:  # noqa: BLE001 - worker dispatch failure must not abort the recovery loop for other jobs
                                 logger.error("Failed to dispatch recovered job %s: %s", job.id, dispatch_exc)
                 else:
                     if job.retry_count >= (job.max_retries or max_retries_setting):
@@ -320,7 +320,7 @@ class ExtractionService:
                     if rows == 1:
                         logger.info("Stale job %s permanently transitioned to FAILED (%s)", job.id, reason)
                         recovered_count += 1
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - recovery loop catches per-job exceptions to ensure remaining stale jobs can still be recovered
                 logger.error("Failed to recover stale job %s: %s", job.id, exc)
 
         return recovered_count
