@@ -272,10 +272,17 @@ if not FIELD_ENCRYPTION_KEY and not DEBUG:
 if FIELD_ENCRYPTION_KEY:
     try:
         from cryptography.fernet import Fernet
-        Fernet(FIELD_ENCRYPTION_KEY.encode('utf-8') if isinstance(FIELD_ENCRYPTION_KEY, str) else FIELD_ENCRYPTION_KEY)
+        raw_keys = (
+            [k.strip() for k in FIELD_ENCRYPTION_KEY.split(',') if k.strip()]
+            if isinstance(FIELD_ENCRYPTION_KEY, str)
+            else [FIELD_ENCRYPTION_KEY]
+        )
+        for rk in raw_keys:
+            Fernet(rk.encode('utf-8') if isinstance(rk, str) else rk)
     except Exception as exc:
         raise ImproperlyConfigured(
-            "Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte url-safe base64-encoded Fernet key. "
+            "Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte url-safe base64-encoded Fernet key "
+            "(or comma-separated list of keys for key rotation). "
             "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
         ) from exc
 

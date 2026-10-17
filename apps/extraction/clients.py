@@ -194,6 +194,40 @@ class ThirdPartyExtractionClient:
         norm_path = re.sub(r'/+', '/', parsed.path)
         return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, norm_path, parsed.query, parsed.fragment))
 
+    @staticmethod
+    def _is_same_provider_host(target_url: str, base_url: str) -> bool:
+        """Determines if target URL belongs to the same provider host as base URL.
+        
+        Protects bearer tokens from being leaked to unintended external hosts during
+        next-page URL pagination.
+        """
+        if not target_url or not base_url:
+            return False
+        target_netloc = urllib.parse.urlsplit(target_url).netloc.lower()
+        base_netloc = urllib.parse.urlsplit(base_url).netloc.lower()
+        if not target_netloc:
+            # Relative URL - resolves against provider base host
+            return True
+        return target_netloc == base_netloc
+
+    def _validate_and_normalize_pagination_url(self, raw_url: str, current_url: str) -> str | None:
+        """Validates and normalizes pagination next URLs.
+        
+        Resolves relative paths, validates schemes, and rejects malformed URLs.
+        """
+        if not raw_url or not isinstance(raw_url, str) or not raw_url.strip():
+            return None
+        cleaned = raw_url.strip()
+        resolved = urllib.parse.urljoin(current_url, cleaned)
+        parsed = urllib.parse.urlsplit(resolved)
+        if parsed.scheme.lower() not in ('http', 'https'):
+            logger.warning("Rejected pagination URL with unsupported scheme: %s", parsed.scheme)
+            return None
+        if not getattr(settings, 'DEBUG', True) and parsed.scheme.lower() != 'https':
+            logger.warning("Rejected non-HTTPS pagination URL in production: %s", resolved)
+            return None
+        return resolved
+
     def _execute_request_with_retries(
         self,
         url: str,
@@ -484,9 +518,14 @@ class ThirdPartyExtractionClient:
                     break
                 visited_urls.add(next_url)
 
+            # Ensure bearer token is not leaked to unintended external hosts or public demo sandboxes
+            req_headers = dict(headers)
+            if not self._is_same_provider_host(current_req_url, url) or self._is_public_demo_endpoint(current_req_url):
+                req_headers.pop('Authorization', None)
+
             response = self._execute_request_with_retries(
                 current_req_url,
-                headers,
+                req_headers,
                 page_params,
                 heartbeat_callback=heartbeat_callback
             )
@@ -556,8 +595,40 @@ class ThirdPartyExtractionClient:
             if not isinstance(page_items, list):
                 raise ExternalServiceError("External service returned unexpected records structure.")
 
-            if not page_items:
-                # No more records on this page, finish paging
+            # Detect cursor or next page link for subsequent requests
+            next_cursor = None
+            next_url = None
+            has_paging_block = False
+            if isinstance(payload, dict):
+                # HubSpot style: {"paging": {"next": {"after": "..."}}}
+                if 'paging' in payload:
+                    has_paging_block = True
+                    paging = payload.get('paging')
+                    if isinstance(paging, dict):
+                        next_obj = paging.get('next')
+                        if isinstance(next_obj, dict):
+                            next_cursor = next_obj.get('after')
+                # Generic cursor style: {"next_cursor": "..."} or {"cursor": "..."}
+                if not next_cursor and ('next_cursor' in payload or 'cursor' in payload):
+                    has_paging_block = True
+                    next_cursor = payload.get('next_cursor') or payload.get('cursor')
+
+                # Next URL style (RFC 5988 / REST next link or payload 'next')
+                links = getattr(response, 'links', None)
+                link_next = links.get('next', {}).get('url') if isinstance(links, dict) else None
+                raw_next_url = payload.get('next') if isinstance(payload.get('next'), str) else link_next
+                if raw_next_url:
+                    next_url = self._validate_and_normalize_pagination_url(raw_next_url, current_req_url)
+
+            # Strip empty or whitespace-only cursors
+            if next_cursor is not None and not str(next_cursor).strip():
+                next_cursor = None
+
+            # Determine if explicit pagination metadata for a subsequent page exists
+            has_explicit_next = bool(next_cursor) or bool(next_url and next_url != current_req_url)
+
+            # An actually empty page with no explicit next metadata terminates pagination cleanly
+            if not page_items and not has_explicit_next:
                 break
 
             new_in_page = 0
@@ -578,52 +649,45 @@ class ThirdPartyExtractionClient:
                 except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                     logger.debug("Heartbeat callback exception ignored: %s", exc)
 
-            # Detect cursor or next page link for subsequent requests
-            next_cursor = None
-            next_url = None
-            has_paging_block = False
-            if isinstance(payload, dict):
-                # HubSpot style: {"paging": {"next": {"after": "..."}}}
-                if 'paging' in payload:
-                    has_paging_block = True
-                    paging = payload.get('paging')
-                    if isinstance(paging, dict):
-                        next_obj = paging.get('next')
-                        if isinstance(next_obj, dict):
-                            next_cursor = next_obj.get('after')
-                # Generic cursor style: {"next_cursor": "..."} or {"cursor": "..."}
-                if not next_cursor and ('next_cursor' in payload or 'cursor' in payload):
-                    has_paging_block = True
-                    next_cursor = payload.get('next_cursor') or payload.get('cursor')
+            # Detect repeated self-referencing next URL as a cycle before requesting next page
+            if next_url and next_url == current_req_url:
+                logger.warning(
+                    "Pagination cycle detected: external provider returned self-referencing next URL ('%s').",
+                    next_url
+                )
+                truncated = True
+                if on_page_limit_action == 'fail':
+                    raise PageLimitExceededError(
+                        message=f"Pagination cycle detected: external provider returned self-referencing next URL '{next_url}'.",
+                        details={'url': next_url}
+                    )
+                break
 
-                # Next URL style (RFC 5988 / REST next link)
-                links = getattr(response, 'links', None)
-                link_next = links.get('next', {}).get('url') if isinstance(links, dict) else None
-                next_url = payload.get('next') if isinstance(payload.get('next'), str) else link_next
-
-            # If cursor pagination is detected or was active
+            # Update detected pagination type
             if has_paging_block or next_cursor:
                 pagination_type = 'cursor'
-
-            # If cursor pagination is active and no next cursor was returned, terminate
-            if pagination_type == 'cursor' and not next_cursor:
-                break
-
-            # If next URL pagination is active
-            if next_url and next_url != current_req_url:
+            elif next_url and next_url != current_req_url:
                 pagination_type = 'next_url'
-            elif pagination_type == 'next_url' and not next_url:
-                break
 
-            # If no new records were extracted on this page, stop to prevent infinite loops
-            if new_in_page == 0:
-                break
-
-            # If explicit next cursor or next link is available, continue to next page;
-            # otherwise, terminate if fewer than effective_page_size items were returned.
-            has_explicit_next = bool(next_cursor) or bool(next_url and next_url != current_req_url)
-            if not has_explicit_next and len(page_items) < effective_page_size:
-                break
+            # Decision to proceed to next page or terminate:
+            if has_explicit_next:
+                # Follow valid pagination metadata even when current page contains only duplicate records (new_in_page == 0)
+                pass
+            else:
+                # No explicit next metadata provided by external API:
+                # For cursor-based pagination, absence of next_cursor marks the end of stream
+                if pagination_type == 'cursor':
+                    break
+                # For next-URL pagination, absence of next_url marks the end of stream
+                if pagination_type == 'next_url':
+                    break
+                # For offset-limit or page-number pagination:
+                # Terminate if page returned fewer items than requested page size
+                if len(page_items) < effective_page_size:
+                    break
+                # Terminate if no new records were found on this page and no next metadata exists
+                if new_in_page == 0:
+                    break
 
         logger.info(
             "Successfully fetched %d records across pages from external provider (truncated=%s).",

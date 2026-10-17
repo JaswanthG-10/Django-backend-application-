@@ -167,28 +167,29 @@ class ExtractionService:
                 return job
             return None
 
-        # Next pending job ordered by created_at
-        candidate = ExtractionJob.objects.filter(
-            status=JobStatus.PENDING
-        ).order_by('created_at').values_list('id', flat=True).first()
-
-        if not candidate:
-            return None
-
-        rows_updated = ExtractionJob.objects.filter(
-            id=candidate,
-            status=JobStatus.PENDING
-        ).update(
-            status=JobStatus.IN_PROGRESS,
-            start_time=now,
-            heartbeat_at=now,
-            updated_at=now
+        # Next pending jobs ordered by created_at (try top candidates to avoid contention misses)
+        candidate_ids = list(
+            ExtractionJob.objects.filter(status=JobStatus.PENDING)
+            .order_by('created_at')
+            .values_list('id', flat=True)[:10]
         )
 
-        if rows_updated == 1:
-            job = ExtractionJob.objects.get(id=candidate)
-            logger.info("Worker atomically claimed next job %s", job.id)
-            return job
+        for candidate_id in candidate_ids:
+            rows_updated = ExtractionJob.objects.filter(
+                id=candidate_id,
+                status=JobStatus.PENDING
+            ).update(
+                status=JobStatus.IN_PROGRESS,
+                start_time=now,
+                heartbeat_at=now,
+                updated_at=now
+            )
+
+            if rows_updated == 1:
+                job = ExtractionJob.objects.get(id=candidate_id)
+                logger.info("Worker atomically claimed next job %s", job.id)
+                return job
+
         return None
 
     @classmethod
@@ -275,6 +276,9 @@ class ExtractionService:
                     if rows == 1:
                         logger.info("Stale job %s safely recovered and re-queued to PENDING (retry %d)", job.id, job.retry_count + 1)
                         recovered_count += 1
+                        if getattr(settings, 'EXTRACTION_ASYNC_EXECUTION', True):
+                            token = job.get_decrypted_token()
+                            cls.dispatch_background_extraction(job_id=job.id, api_token=token)
                 else:
                     reason = "Max retries exceeded" if job.retry_count >= (job.max_retries or max_retries_setting) else "Missing recovery credentials"
                     code = 'MAX_RETRIES_EXCEEDED' if 'Max' in reason else 'WORKER_ABANDONED_TIMEOUT'

@@ -1,11 +1,14 @@
 """Database models for the Data Extraction Service."""
 import hashlib
+import logging
 import uuid
 
 from django.db import models
 from django.utils import timezone
 
 from apps.common.exceptions import InvalidStateTransitionError
+
+logger = logging.getLogger('apps.extraction.models')
 
 
 class JobStatus(models.TextChoices):
@@ -190,7 +193,13 @@ class ExtractionJob(models.Model):
             return None
         try:
             return decrypt_secret(self.encrypted_token)
-        except (InvalidToken, ValueError, TypeError):
+        except (InvalidToken, ValueError, TypeError) as exc:
+            logger.error(
+                "Failed to decrypt stored token for job %s: %s. "
+                "The encryption key (FIELD_ENCRYPTION_KEY) may have changed or been rotated without fallback keys.",
+                self.id,
+                exc
+            )
             return None
 
     def clear_encrypted_token(self) -> None:

@@ -12,8 +12,12 @@ logger = logging.getLogger('apps.common.encryption')
 _fernet_instance: Fernet | None = None
 
 
-def get_fernet() -> Fernet:
-    """Returns a cached Fernet cipher instance using FIELD_ENCRYPTION_KEY."""
+def get_fernet():
+    """Returns a cached Fernet or MultiFernet cipher instance using FIELD_ENCRYPTION_KEY.
+    
+    Supports key rotation via comma-separated keys: encryption uses the primary (first) key,
+    while decryption transparently tries each key in order.
+    """
     global _fernet_instance
     if _fernet_instance is not None:
         return _fernet_instance
@@ -29,11 +33,18 @@ def get_fernet() -> Fernet:
         return _fernet_instance
 
     try:
-        # Validate that the key is a valid 32-byte urlsafe base64-encoded key
-        if isinstance(raw_key, str):
-            raw_key_bytes = raw_key.encode('utf-8')
-        else:
-            raw_key_bytes = raw_key
+        from cryptography.fernet import MultiFernet
+
+        # Support comma-separated key rotation: primary_key,fallback_key1,fallback_key2
+        if isinstance(raw_key, str) and ',' in raw_key:
+            key_list = [k.strip().encode('utf-8') for k in raw_key.split(',') if k.strip()]
+            _fernet_instance = MultiFernet([Fernet(k) for k in key_list])
+            return _fernet_instance
+        elif isinstance(raw_key, (list, tuple)):
+            _fernet_instance = MultiFernet([Fernet(k.encode('utf-8') if isinstance(k, str) else k) for k in raw_key])
+            return _fernet_instance
+
+        raw_key_bytes = raw_key.encode('utf-8') if isinstance(raw_key, str) else raw_key
         _fernet_instance = Fernet(raw_key_bytes)
         return _fernet_instance
     except Exception as exc:
