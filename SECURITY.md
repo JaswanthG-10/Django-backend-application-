@@ -105,6 +105,73 @@ The `FIELD_ENCRYPTION_KEY` encrypts sensitive external tokens stored in `Extract
 
 ---
 
+## Automated Local Rotation Script (`scripts/rotate_secrets.py`)
+
+A automated helper script is provided to safely rotate local environment credentials without manual string generation or accidental credential leakage:
+
+```bash
+# Standard rotation: generates new SECRET_KEY, API_KEY_SECRET, and FIELD_ENCRYPTION_KEY,
+# preserving the previous FIELD_ENCRYPTION_KEY as fallback (<NEW>,<OLD>):
+python scripts/rotate_secrets.py
+
+# Drop legacy encryption keys once historical data is re-encrypted:
+python scripts/rotate_secrets.py --drop-old-encryption-key
+```
+
+### Script Security Features:
+- **Strict File Safety**: The script requires the target file to be named `.env` and checks `git ls-files --error-unmatch .env` to verify the file is NOT tracked by git.
+- **Automated Backup**: Generates a timestamped `.env.bak-YYYYMMDDTHHMMSSZ` file before altering any lines.
+- **Zero-Leakage Output**: Secret values are generated in memory and written directly to disk. Only setting names and operational summaries are printed to terminal output.
+- **Preserves Configuration**: Preserves existing file comments, spacing, and unrelated environment variables.
+
+---
+
+## Recommended Secret Rotation Order
+
+When rotating secrets in production, follow this sequenced workflow to avoid service downtime or lost data:
+
+```
+1. External Providers   ->  2. Local / Stored Config  ->  3. Service Restart
+   (DB Password, CRM           (Run rotate_secrets.py,       (Restart web & worker
+    API Tokens, Webhooks)       update DATABASE_URL)          processes)
+         |                             |                           |
+         v                             v                           v
+4. Verification         ->  5. Data Re-encryption     ->  6. Drop Fallback Keys
+   (Health checks 200,         (Migrate encrypted            (Run rotate_secrets.py
+    Verify API keys)            records to new key)           --drop-old-encryption-key)
+```
+
+1. **Rotate External Services First**: Provision new database credentials in your database console and generate new third-party API tokens/webhook secrets in upstream developer portals.
+2. **Update Environment**: Run `python scripts/rotate_secrets.py` (or inject new secrets via your production vault/CI store) and update external URLs/tokens.
+3. **Restart Application Services**: Restart all web and worker processes to reload configuration.
+4. **Verify Health and Operations**: Validate that `GET /api/v1/health` returns 200 and test endpoints with the newly issued credentials.
+5. **Re-encrypt Stored Data**: Re-encrypt legacy database fields using the new primary key (or allow active extraction jobs to complete and automatically scrub sensitive tokens).
+6. **Drop Legacy Fallback Keys**: Once all historical records have been re-encrypted, run `python scripts/rotate_secrets.py --drop-old-encryption-key` to complete the rotation cycle.
+
+---
+
+## External Provider Dashboards Checklist
+
+For manual secret rotation across external provider consoles, track completion with this checklist:
+
+- [ ] **Database Provider (e.g., Supabase / AWS RDS / Neon)**:
+  - Generate new database password in provider dashboard.
+  - Update `DATABASE_URL` with new credentials.
+  - Verify database pooler connectivity.
+  - Revoke previous user role credentials.
+- [ ] **External CRM / Data Providers (e.g., HubSpot CRM / Salesforce)**:
+  - Create new API access token or OAuth client credentials in developer portal.
+  - Update `EXTERNAL_API_DEFAULT_TOKEN` in environment configuration.
+  - Revoke obsolete API keys in provider console.
+- [ ] **Third-Party Webhooks & Request Signing**:
+  - Rotate HMAC webhook signing secrets in provider settings.
+  - Update application verification secrets.
+- [ ] **Application Restart & Deployment**:
+  - Deploy updated configuration to all container/server instances.
+  - Confirm logs report clean startup and healthy database connections.
+
+---
+
 ## SSRF Hardening & Network Egress Controls
 
 The extraction client enforces strict network egress controls and anti-SSRF protections to defend internal network infrastructure:
