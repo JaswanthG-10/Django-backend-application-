@@ -7,7 +7,7 @@ import re
 import time
 import urllib.parse
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 from django.conf import settings
@@ -16,11 +16,36 @@ from apps.common.exceptions import (
     ExternalServiceAuthError,
     ExternalServiceError,
     ExternalServiceTimeoutError,
+    PageLimitExceededError,
     RateLimitExceededError,
     ResourceNotFoundError,
 )
 
 logger = logging.getLogger('apps.extraction.clients')
+
+
+class ExtractionResult(NamedTuple):
+    """Result object encapsulating extracted records and pagination safety status."""
+    records: list[dict[str, Any]]
+    truncated: bool = False
+
+
+def _sleep_with_heartbeat(
+    seconds: float,
+    heartbeat_callback: Callable[[], None] | None = None,
+    chunk_size: float = 30.0
+) -> None:
+    """Sleeps for given duration in chunks, invoking heartbeat callback between chunks."""
+    remaining = seconds
+    while remaining > 0:
+        chunk = min(remaining, chunk_size)
+        time.sleep(chunk)
+        remaining -= chunk
+        if heartbeat_callback and remaining > 0:
+            try:
+                heartbeat_callback()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Heartbeat callback exception ignored during retry sleep: %s", exc)
 
 
 def parse_retry_after(header_val: str | None) -> float | None:
@@ -174,23 +199,30 @@ class ThirdPartyExtractionClient:
         url: str,
         headers: dict[str, str],
         params: dict[str, Any],
-        max_retry_after: float | None = None
+        max_retry_after: float | None = None,
+        heartbeat_callback: Callable[[], None] | None = None,
     ) -> requests.Response:
-        """Executes GET request with exponential backoff on 429 and 5xx errors.
+        """Executes GET request with separate retry budgets for 429 rate limits and 5xx/timeout errors.
         
-        Honors server Retry-After (seconds and HTTP-date) without arbitrary capping,
-        enforces max_retry_after deadline thresholds, and applies jitter on 5xx errors.
+        Honors server Retry-After (seconds and HTTP-date), enforces per-wait and cumulative total wait
+        deadlines, applies chunked heartbeat updates during wait intervals, and guarantees tokens are
+        never leaked in 429 logs or error messages.
         """
-        attempt = 0
+        server_attempts = 0
+        rate_limit_attempts = 0
+        total_rate_limit_waited = 0.0
         backoff_delay = 0.2
+
+        max_rate_limit_retries = getattr(settings, 'EXTERNAL_API_MAX_RATE_LIMIT_RETRIES', 5)
+        max_total_rate_limit_wait = getattr(settings, 'EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS', 300.0)
         max_allowed_retry_after = (
             max_retry_after
             if max_retry_after is not None
             else getattr(settings, 'EXTERNAL_API_MAX_RETRY_AFTER_SECONDS', 60.0)
         )
+        heartbeat_chunk_seconds = getattr(settings, 'EXTRACTION_HEARTBEAT_CHUNK_SECONDS', 30.0)
 
         while True:
-            attempt += 1
             try:
                 response = self.session.get(
                     url,
@@ -199,17 +231,18 @@ class ThirdPartyExtractionClient:
                     timeout=self.timeout
                 )
             except requests.exceptions.Timeout as exc:
-                if attempt <= self.max_retries:
-                    jitter = random.uniform(0.05, 0.15)
+                server_attempts += 1
+                if server_attempts <= self.max_retries:
+                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
                     delay = backoff_delay + jitter
                     logger.warning(
-                        "Request timed out on attempt %d/%d; retrying in %.2fs | url=%s",
-                        attempt, self.max_retries, delay, url
+                        "Request timed out on server attempt %d/%d; retrying in %.2fs | url=%s",
+                        server_attempts, self.max_retries, delay, url
                     )
                     time.sleep(delay)
                     backoff_delay *= 2
                     continue
-                logger.error("External service timeout after %d attempts | url=%s", attempt, url)
+                logger.error("External service timeout after %d attempts | url=%s", server_attempts, url)
                 raise ExternalServiceTimeoutError(
                     message=f"External data source timed out after {self.timeout} seconds.",
                     details={'url': url, 'timeout_seconds': self.timeout}
@@ -223,51 +256,80 @@ class ThirdPartyExtractionClient:
 
             status_code = response.status_code
 
-            # Handle 429 Rate Limit
+            # Handle 429 Rate Limit (Separate retry budget from 5xx/timeouts)
             if status_code == 429:
-                if attempt > self.max_retries:
-                    logger.warning("Rate limit retry attempts exhausted (%d/%d) | url=%s", attempt, self.max_retries, url)
+                rate_limit_attempts += 1
+                if rate_limit_attempts > max_rate_limit_retries:
+                    logger.warning(
+                        "Rate limit retry attempts exhausted (%d/%d) | url=%s",
+                        rate_limit_attempts, max_rate_limit_retries, url
+                    )
                     return response
 
                 retry_after_header = response.headers.get('Retry-After')
                 parsed_delay = parse_retry_after(retry_after_header)
 
                 if parsed_delay is not None:
-                    # If delay exceeds maximum allowed deadline, fail safely instead of waiting or retrying early
+                    # Per-wait ceiling check
                     if parsed_delay > max_allowed_retry_after:
                         logger.warning(
-                            "429 Retry-After delay (%.2fs) exceeds maximum allowed threshold (%.2fs) | url=%s",
+                            "429 Retry-After delay (%.2fs) exceeds maximum allowed per-wait threshold (%.2fs) | url=%s",
                             parsed_delay, max_allowed_retry_after, url
                         )
                         raise RateLimitExceededError(
-                            message=f"External rate limit delay of {parsed_delay:.1f}s exceeds maximum allowed threshold of {max_allowed_retry_after:.1f}s.",
+                            message=(
+                                f"External rate limit delay of {parsed_delay:.1f}s "
+                                f"exceeds maximum allowed threshold of {max_allowed_retry_after:.1f}s."
+                            ),
                             details={'status_code': 429, 'retry_after': parsed_delay, 'max_allowed': max_allowed_retry_after}
                         )
                     wait_time = parsed_delay
                 else:
-                    # Malformed or missing Retry-After header: fall back safely to bounded exponential backoff with jitter
-                    jitter = random.uniform(0.05, 0.15)
+                    # Missing/malformed Retry-After: fall back to exponential backoff with jitter
+                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
                     wait_time = backoff_delay + jitter
                     backoff_delay *= 2
 
+                # Cumulative total wait ceiling check
+                if total_rate_limit_waited + wait_time > max_total_rate_limit_wait:
+                    logger.warning(
+                        "429 total accumulated wait (%.2fs) would exceed maximum total rate limit wait ceiling (%.2fs) | url=%s",
+                        total_rate_limit_waited + wait_time, max_total_rate_limit_wait, url
+                    )
+                    raise RateLimitExceededError(
+                        message=(
+                            f"Total rate limit wait time ({total_rate_limit_waited + wait_time:.1f}s) "
+                            f"exceeded ceiling of {max_total_rate_limit_wait:.1f}s."
+                        ),
+                        details={
+                            'status_code': 429,
+                            'total_waited': total_rate_limit_waited,
+                            'max_total_wait': max_total_rate_limit_wait
+                        }
+                    )
+
+                total_rate_limit_waited += wait_time
                 logger.warning(
-                    "Hit 429 Rate Limit on attempt %d/%d; waiting %.2fs before retrying | url=%s",
-                    attempt, self.max_retries, wait_time, url
+                    "Hit 429 Rate Limit on rate-limit attempt %d/%d; waiting %.2fs (total waited: %.2fs) before retrying | url=%s",
+                    rate_limit_attempts, max_rate_limit_retries, wait_time, total_rate_limit_waited, url
                 )
-                time.sleep(wait_time)
+                _sleep_with_heartbeat(wait_time, heartbeat_callback, chunk_size=heartbeat_chunk_seconds)
                 continue
 
-            # Handle 5xx Server Errors (transient server errors)
-            if status_code >= 500 and attempt <= self.max_retries:
-                jitter = random.uniform(0.05, 0.15)
-                delay = backoff_delay + jitter
-                logger.warning(
-                    "Hit HTTP %d on attempt %d/%d; retrying in %.2fs | url=%s",
-                    status_code, attempt, self.max_retries, delay, url
-                )
-                time.sleep(delay)
-                backoff_delay *= 2
-                continue
+            # Handle 5xx Server Errors (Separate retry budget from 429s)
+            if status_code >= 500:
+                server_attempts += 1
+                if server_attempts <= self.max_retries:
+                    jitter = random.uniform(0.05, 0.15)  # noqa: S311
+                    delay = backoff_delay + jitter
+                    logger.warning(
+                        "Hit HTTP %d on attempt %d/%d; retrying in %.2fs | url=%s",
+                        status_code, server_attempts, self.max_retries, delay, url
+                    )
+                    time.sleep(delay)
+                    backoff_delay *= 2
+                    continue
+                return response
 
             # Non-retryable responses returned immediately
             return response
@@ -306,9 +368,10 @@ class ThirdPartyExtractionClient:
         source_type: str = 'crm',
         filters: dict[str, Any] | None = None,
         max_pages: int | None = None,
-        page_size: int = 20,
+        page_size: int | None = None,
         heartbeat_callback: Callable[[], None] | None = None,
-    ) -> list[dict[str, Any]]:
+        on_page_limit: str | None = None,
+    ) -> ExtractionResult:
         """Fetches and pages through records from external provider endpoint.
         
         Continues fetching pages until the external provider indicates no further records
@@ -347,16 +410,29 @@ class ThirdPartyExtractionClient:
         next_cursor = None
         next_url = url
         pagination_type = getattr(settings, 'EXTERNAL_API_PAGINATION_TYPE', 'auto').lower()
-        max_pages_limit = max_pages or getattr(settings, 'EXTERNAL_API_MAX_PAGES', 500)
+        effective_page_size = page_size if page_size is not None else getattr(settings, 'EXTERNAL_API_PAGE_SIZE', 100)
+        max_pages_limit = max_pages or getattr(settings, 'EXTERNAL_API_MAX_PAGES', 2000)
+        on_page_limit_action = (on_page_limit or getattr(settings, 'EXTERNAL_API_ON_PAGE_LIMIT', 'fail')).lower()
+        truncated = False
 
         page = 0
         while True:
             page += 1
             if page > max_pages_limit:
+                if on_page_limit_action == 'fail':
+                    logger.error(
+                        "Reached maximum safety page limit (%d). Terminating extraction with PAGE_LIMIT_EXCEEDED.",
+                        max_pages_limit
+                    )
+                    raise PageLimitExceededError(
+                        message=f"External data extraction exceeded safety limit of {max_pages_limit} pages.",
+                        details={'max_pages': max_pages_limit, 'page': page}
+                    )
                 logger.warning(
-                    "Reached maximum safety page limit (%d). Terminating pagination to prevent runaway loops.",
+                    "Reached maximum safety page limit (%d). Terminating pagination with truncated=True as configured.",
                     max_pages_limit
                 )
+                truncated = True
                 break
 
             page_params = dict(filters or {})
@@ -366,31 +442,54 @@ class ThirdPartyExtractionClient:
             if pagination_type == 'cursor' or (pagination_type == 'auto' and next_cursor):
                 cursor_param = getattr(settings, 'EXTERNAL_API_CURSOR_PARAM', 'after')
                 page_params[cursor_param] = next_cursor
-                page_params['limit'] = page_size
+                page_params['limit'] = effective_page_size
             elif pagination_type == 'offset_limit':
-                page_params['offset'] = (page - 1) * page_size
-                page_params['limit'] = page_size
+                page_params['offset'] = (page - 1) * effective_page_size
+                page_params['limit'] = effective_page_size
             else:
                 # Default page-number pagination
                 page_params['page'] = page
-                page_params['limit'] = page_size
+                page_params['limit'] = effective_page_size
                 page_params['_page'] = page
-                page_params['_limit'] = page_size
+                page_params['_limit'] = effective_page_size
 
             # Cycle detection for cursor and next_url to prevent infinite loops
             if next_cursor:
                 if next_cursor in visited_cursors:
-                    logger.warning("Repeated pagination cursor detected ('%s'). Terminating to prevent infinite loop.", next_cursor)
+                    logger.warning(
+                        "Repeated pagination cursor detected ('%s'). Terminating to prevent infinite loop.",
+                        next_cursor
+                    )
+                    truncated = True
+                    if on_page_limit_action == 'fail':
+                        raise PageLimitExceededError(
+                            message=f"Pagination cycle detected: cursor '{next_cursor}' was repeated by external provider.",
+                            details={'cursor': next_cursor}
+                        )
                     break
                 visited_cursors.add(next_cursor)
 
             if next_url and next_url != url:
                 if next_url in visited_urls:
-                    logger.warning("Repeated pagination URL detected ('%s'). Terminating to prevent infinite loop.", next_url)
+                    logger.warning(
+                        "Repeated pagination URL detected ('%s'). Terminating to prevent infinite loop.",
+                        next_url
+                    )
+                    truncated = True
+                    if on_page_limit_action == 'fail':
+                        raise PageLimitExceededError(
+                            message=f"Pagination cycle detected: URL '{next_url}' was repeated by external provider.",
+                            details={'url': next_url}
+                        )
                     break
                 visited_urls.add(next_url)
 
-            response = self._execute_request_with_retries(current_req_url, headers, page_params)
+            response = self._execute_request_with_retries(
+                current_req_url,
+                headers,
+                page_params,
+                heartbeat_callback=heartbeat_callback
+            )
             status_code = response.status_code
 
             if status_code in (401, 403):
@@ -521,10 +620,14 @@ class ThirdPartyExtractionClient:
                 break
 
             # If explicit next cursor or next link is available, continue to next page;
-            # otherwise, terminate if fewer than page_size items were returned.
+            # otherwise, terminate if fewer than effective_page_size items were returned.
             has_explicit_next = bool(next_cursor) or bool(next_url and next_url != current_req_url)
-            if not has_explicit_next and len(page_items) < page_size:
+            if not has_explicit_next and len(page_items) < effective_page_size:
                 break
 
-        logger.info("Successfully fetched %d records across pages from external provider.", len(all_records))
-        return all_records
+        logger.info(
+            "Successfully fetched %d records across pages from external provider (truncated=%s).",
+            len(all_records),
+            truncated
+        )
+        return ExtractionResult(records=all_records, truncated=truncated)

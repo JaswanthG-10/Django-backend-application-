@@ -407,15 +407,36 @@ class ExtractionService:
         try:
             if mock_records is not None:
                 records_data = mock_records
+                is_truncated = False
             else:
                 filters = job.metadata.get('filters', {})
                 heartbeat_cb = lambda: ExtractionService.update_job_heartbeat(job.id)
-                records_data = self.client.extract_data(
+                page_size = getattr(settings, 'EXTERNAL_API_PAGE_SIZE', 100)
+                on_page_limit = getattr(settings, 'EXTERNAL_API_ON_PAGE_LIMIT', 'fail')
+                extract_res = self.client.extract_data(
                     api_token=active_token,
                     source_type=job.source_type,
                     filters=filters,
-                    heartbeat_callback=heartbeat_cb
+                    page_size=page_size,
+                    heartbeat_callback=heartbeat_cb,
+                    on_page_limit=on_page_limit,
                 )
+                if isinstance(extract_res, tuple) and hasattr(extract_res, 'records'):
+                    records_data = extract_res.records
+                    is_truncated = extract_res.truncated
+                elif isinstance(extract_res, tuple):
+                    records_data = extract_res[0]
+                    is_truncated = extract_res[1] if len(extract_res) > 1 else False
+                elif isinstance(extract_res, list):
+                    records_data = extract_res
+                    is_truncated = False
+                else:
+                    records_data = getattr(extract_res, 'records', extract_res)
+                    is_truncated = getattr(extract_res, 'truncated', False)
+
+            if is_truncated and on_page_limit == 'fail':
+                from apps.common.exceptions import PageLimitExceededError
+                raise PageLimitExceededError("External data extraction was truncated before completion.")
 
             # Check if job was cancelled while external network request was executing
             job.refresh_from_db()
@@ -460,9 +481,14 @@ class ExtractionService:
 
                 # Accurately reflect actual persisted count in database
                 actual_persisted_count = ExtractedRecord.objects.filter(job=job).count()
+                job_metadata = dict(job.metadata or {})
+                if is_truncated:
+                    job_metadata['truncated'] = True
+
                 job.transition_to(
                     JobStatus.COMPLETED,
-                    record_count=actual_persisted_count
+                    record_count=actual_persisted_count,
+                    metadata=job_metadata
                 )
 
             logger.info("Extraction job %s completed successfully with %d records.", job.id, actual_persisted_count)
