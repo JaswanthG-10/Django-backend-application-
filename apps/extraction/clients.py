@@ -1,7 +1,12 @@
 """Client for communicating with external third-party data providers."""
+import re
 import time
+import random
+import email.utils
+import datetime
 import logging
-from typing import List, Dict, Any, Optional
+import urllib.parse
+from typing import List, Dict, Any, Optional, Callable
 import requests
 from django.conf import settings
 from apps.common.exceptions import (
@@ -15,15 +20,51 @@ from apps.common.exceptions import (
 logger = logging.getLogger('apps.extraction.clients')
 
 
+def parse_retry_after(header_val: Optional[str]) -> Optional[float]:
+    """Parses Retry-After header into delay in seconds.
+    
+    Supports both standard RFC 7231 / RFC 2616 formats:
+    1. Non-negative integer/decimal seconds (e.g. '120', '5')
+    2. HTTP-date (e.g. 'Wed, 21 Oct 2026 07:28:00 GMT')
+    
+    Returns delay in seconds (>= 0.0), or None if missing, empty, or unparseable.
+    """
+    if not header_val or not str(header_val).strip():
+        return None
+    val = str(header_val).strip()
+
+    # Format 1: Non-negative seconds
+    try:
+        delay = float(val)
+        return max(0.0, delay)
+    except (ValueError, TypeError):
+        pass
+
+    # Format 2: HTTP-date string
+    try:
+        parsed_dt = email.utils.parsedate_to_datetime(val)
+        if parsed_dt:
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=datetime.timezone.utc)
+            now = datetime.datetime.now(datetime.timezone.utc)
+            delay = (target_dt := parsed_dt) and (target_dt - now).total_seconds()
+            return max(0.0, delay)
+    except Exception:
+        pass
+
+    return None
+
+
 class ThirdPartyExtractionClient:
     """Production-ready HTTP client for extracting data from external APIs.
     
     Includes:
-    - Multi-page pagination traversal
+    - Multi-page pagination traversal without arbitrary page limits
     - Automatic exponential backoff retries on HTTP 429 and 5xx server errors
-    - Respect for Retry-After headers
+    - Accurate respect for Retry-After headers (numeric seconds & HTTP-date)
+    - Deadline enforcement on maximum rate limit wait times
     - Safe token masking in logs
-    - Flexible normalization across real public sources (e.g. JSONPlaceholder, ReqRes, HubSpot)
+    - Flexible normalization across real public sources (e.g. HubSpot CRM, REST APIs)
     """
 
     def __init__(
@@ -33,7 +74,7 @@ class ThirdPartyExtractionClient:
         max_retries: int = 3,
         session: Optional[requests.Session] = None
     ):
-        raw_base_url = (base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', 'https://jsonplaceholder.typicode.com')).rstrip('/')
+        raw_base_url = (base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', 'https://api.hubapi.com')).rstrip('/')
         if not getattr(settings, 'DEBUG', True) and raw_base_url.lower().startswith('http://'):
             raise ExternalServiceError("External provider base URL must use HTTPS in production.")
         self.base_url = raw_base_url
@@ -69,34 +110,81 @@ class ThirdPartyExtractionClient:
         return any(domain in lowered for domain in public_demo_domains)
 
     def _determine_url(self, source_type: str) -> str:
-        """Determines target URL based on configured provider endpoint template."""
+        """Determines target URL based on configured provider endpoint template.
+        
+        Guarantees clean URL construction without missing or duplicate slashes,
+        and validates that the final URL is an absolute HTTP/HTTPS URL.
+        """
         template = getattr(settings, 'EXTERNAL_API_ENDPOINT_TEMPLATE', None)
-        if template:
-            return template.format(base_url=self.base_url, source_type=source_type)
-
-        # HubSpot CRM object endpoints
-        if 'hubapi' in self.base_url.lower():
-            endpoint_name = 'contacts' if source_type in ('crm', 'contacts') else source_type
-            return f"{self.base_url}/crm/v3/objects/{endpoint_name}"
+        base = self.base_url.rstrip('/')
+        clean_source = source_type.strip().lower()
 
         # JSONPlaceholder public testing mock
-        if 'jsonplaceholder' in self.base_url.lower():
-            if source_type in ('crm', 'contacts', 'users'):
-                return f"{self.base_url}/users"
-            return f"{self.base_url}/{source_type}"
+        if 'jsonplaceholder' in base.lower():
+            target = 'users' if clean_source in ('crm', 'contacts') else clean_source
+            return self._validate_and_normalize_url(f"{base}/{target}")
 
-        # Standard CRM API pattern
-        return f"{self.base_url}/{source_type}/records"
+        # Legacy / mock testing endpoint fallback
+        if 'crm-provider.test' in base.lower():
+            return self._validate_and_normalize_url(f"{base}/{clean_source}/records")
+
+        # Map common aliases if using HubSpot CRM
+        if 'hubapi' in base:
+            endpoint_name = 'contacts' if clean_source in ('crm', 'contacts') else clean_source
+        else:
+            endpoint_name = clean_source
+
+        if template and str(template).strip():
+            template_str = str(template).strip()
+            if '{base_url}' in template_str:
+                formatted = template_str.format(base_url=base, source_type=endpoint_name)
+            else:
+                rel = template_str.format(source_type=endpoint_name).lstrip('/')
+                formatted = f"{base}/{rel}"
+        elif 'hubapi' in base:
+            formatted = f"{base}/crm/v3/objects/{endpoint_name}"
+        else:
+            formatted = f"{base}/{endpoint_name}/records"
+
+        return self._validate_and_normalize_url(formatted)
+
+    def _validate_and_normalize_url(self, formatted: str) -> str:
+        """Validates URL structure and collapses duplicate path slashes."""
+        parsed = urllib.parse.urlsplit(formatted)
+        if not parsed.scheme or not parsed.netloc:
+            raise ExternalServiceError(
+                message=f"Configured external API URL '{formatted}' is invalid. An absolute HTTP/HTTPS URL is required.",
+                details={'url': formatted}
+            )
+        if not getattr(settings, 'DEBUG', True) and parsed.scheme.lower() != 'https':
+            raise ExternalServiceError(
+                message="External provider URL must use HTTPS in production.",
+                details={'url': formatted}
+            )
+
+        # Collapse duplicate slashes in URL path (e.g. //crm -> /crm)
+        norm_path = re.sub(r'/+', '/', parsed.path)
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, norm_path, parsed.query, parsed.fragment))
 
     def _execute_request_with_retries(
         self,
         url: str,
         headers: Dict[str, str],
-        params: Dict[str, Any]
+        params: Dict[str, Any],
+        max_retry_after: Optional[float] = None
     ) -> requests.Response:
-        """Executes GET request with exponential backoff on 429 and 5xx errors."""
+        """Executes GET request with exponential backoff on 429 and 5xx errors.
+        
+        Honors server Retry-After (seconds and HTTP-date) without arbitrary capping,
+        enforces max_retry_after deadline thresholds, and applies jitter on 5xx errors.
+        """
         attempt = 0
         backoff_delay = 0.2
+        max_allowed_retry_after = (
+            max_retry_after
+            if max_retry_after is not None
+            else getattr(settings, 'EXTERNAL_API_MAX_RETRY_AFTER_SECONDS', 60.0)
+        )
 
         while True:
             attempt += 1
@@ -109,8 +197,13 @@ class ThirdPartyExtractionClient:
                 )
             except requests.exceptions.Timeout as exc:
                 if attempt <= self.max_retries:
-                    logger.warning("Request timed out on attempt %d/%d; retrying in %.2fs | url=%s", attempt, self.max_retries, backoff_delay, url)
-                    time.sleep(backoff_delay)
+                    jitter = random.uniform(0.05, 0.15)
+                    delay = backoff_delay + jitter
+                    logger.warning(
+                        "Request timed out on attempt %d/%d; retrying in %.2fs | url=%s",
+                        attempt, self.max_retries, delay, url
+                    )
+                    time.sleep(delay)
                     backoff_delay *= 2
                     continue
                 logger.error("External service timeout after %d attempts | url=%s", attempt, url)
@@ -127,46 +220,73 @@ class ThirdPartyExtractionClient:
 
             status_code = response.status_code
 
-            # Handle 429 Rate Limit with Retry-After if retries remain
-            if status_code == 429 and attempt <= self.max_retries:
+            # Handle 429 Rate Limit
+            if status_code == 429:
+                if attempt > self.max_retries:
+                    logger.warning("Rate limit retry attempts exhausted (%d/%d) | url=%s", attempt, self.max_retries, url)
+                    return response
+
                 retry_after_header = response.headers.get('Retry-After')
-                try:
-                    retry_seconds = float(retry_after_header) if retry_after_header else backoff_delay
-                except (ValueError, TypeError):
-                    retry_seconds = backoff_delay
-                retry_seconds = min(retry_seconds, 2.0)
-                logger.warning("Hit 429 Rate Limit on attempt %d/%d; sleeping %.2fs before retry | url=%s", attempt, self.max_retries, retry_seconds, url)
-                time.sleep(retry_seconds)
-                backoff_delay *= 2
+                parsed_delay = parse_retry_after(retry_after_header)
+
+                if parsed_delay is not None:
+                    # If delay exceeds maximum allowed deadline, fail safely instead of waiting or retrying early
+                    if parsed_delay > max_allowed_retry_after:
+                        logger.warning(
+                            "429 Retry-After delay (%.2fs) exceeds maximum allowed threshold (%.2fs) | url=%s",
+                            parsed_delay, max_allowed_retry_after, url
+                        )
+                        raise RateLimitExceededError(
+                            message=f"External rate limit delay of {parsed_delay:.1f}s exceeds maximum allowed threshold of {max_allowed_retry_after:.1f}s.",
+                            details={'status_code': 429, 'retry_after': parsed_delay, 'max_allowed': max_allowed_retry_after}
+                        )
+                    wait_time = parsed_delay
+                else:
+                    # Malformed or missing Retry-After header: fall back safely to bounded exponential backoff with jitter
+                    jitter = random.uniform(0.05, 0.15)
+                    wait_time = backoff_delay + jitter
+                    backoff_delay *= 2
+
+                logger.warning(
+                    "Hit 429 Rate Limit on attempt %d/%d; waiting %.2fs before retrying | url=%s",
+                    attempt, self.max_retries, wait_time, url
+                )
+                time.sleep(wait_time)
                 continue
 
-            # Handle 5xx Server Errors if retries remain
+            # Handle 5xx Server Errors (transient server errors)
             if status_code >= 500 and attempt <= self.max_retries:
-                logger.warning("Hit HTTP %d on attempt %d/%d; retrying in %.2fs | url=%s", status_code, attempt, self.max_retries, backoff_delay, url)
-                time.sleep(backoff_delay)
+                jitter = random.uniform(0.05, 0.15)
+                delay = backoff_delay + jitter
+                logger.warning(
+                    "Hit HTTP %d on attempt %d/%d; retrying in %.2fs | url=%s",
+                    status_code, attempt, self.max_retries, delay, url
+                )
+                time.sleep(delay)
                 backoff_delay *= 2
                 continue
 
+            # Non-retryable responses returned immediately
             return response
 
     def _normalize_raw_record(self, raw: Dict[str, Any]) -> Dict[str, Any]:
         """Normalizes diverse third-party schemas into standard entity records."""
         rec_id = str(raw.get('id') or raw.get('id_from_service') or raw.get('uuid') or '')
-        email = raw.get('email') or (raw.get('properties', {}).get('email') if isinstance(raw.get('properties'), dict) else None)
+        props = raw.get('properties') if isinstance(raw.get('properties'), dict) else {}
+        email = raw.get('email') or props.get('email')
 
-        first_name = raw.get('first_name', '')
-        last_name = raw.get('last_name', '')
+        first_name = raw.get('first_name', '') or props.get('firstname', '') or props.get('first_name', '')
+        last_name = raw.get('last_name', '') or props.get('lastname', '') or props.get('last_name', '')
 
-        # Fallback if provider returns a single 'name' field (e.g. JSONPlaceholder)
+        # Fallback if provider returns a single 'name' field
         if not first_name and not last_name and raw.get('name'):
             parts = str(raw['name']).strip().split(' ', 1)
             first_name = parts[0]
             last_name = parts[1] if len(parts) > 1 else ''
 
-        custom = raw.get('custom_fields') or raw.get('properties') or {}
+        custom = raw.get('custom_fields') or props or {}
         if not custom:
-            # Collect other attributes as custom fields
-            custom = {k: v for k, v in raw.items() if k not in ('id', 'id_from_service', 'email', 'first_name', 'last_name', 'name')}
+            custom = {k: v for k, v in raw.items() if k not in ('id', 'id_from_service', 'email', 'first_name', 'last_name', 'name', 'properties')}
 
         return {
             'id': rec_id,
@@ -182,13 +302,15 @@ class ThirdPartyExtractionClient:
         api_token: str,
         source_type: str = 'crm',
         filters: Optional[Dict[str, Any]] = None,
-        max_pages: int = 5,
-        page_size: int = 20
+        max_pages: Optional[int] = None,
+        page_size: int = 20,
+        heartbeat_callback: Optional[Callable[[], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetches and pages through records from external provider endpoint.
         
-        Supports configurable provider endpoints, cursor/offset/page pagination,
-        exponential backoff retries, and data normalization.
+        Continues fetching pages until the external provider indicates no further records
+        or pages exist, supporting cursor, next-url, page-number, and offset pagination.
+        Includes cycle detection and heartbeat updates across page iterations.
         """
         if not api_token or not api_token.strip():
             raise ExternalServiceAuthError("API token must not be empty.")
@@ -217,11 +339,23 @@ class ThirdPartyExtractionClient:
 
         all_records: List[Dict[str, Any]] = []
         seen_ids = set()
+        visited_urls = set()
+        visited_cursors = set()
         next_cursor = None
         next_url = url
         pagination_type = getattr(settings, 'EXTERNAL_API_PAGINATION_TYPE', 'auto').lower()
+        max_pages_limit = max_pages or getattr(settings, 'EXTERNAL_API_MAX_PAGES', 500)
 
-        for page in range(1, max_pages + 1):
+        page = 0
+        while True:
+            page += 1
+            if page > max_pages_limit:
+                logger.warning(
+                    "Reached maximum safety page limit (%d). Terminating pagination to prevent runaway loops.",
+                    max_pages_limit
+                )
+                break
+
             page_params = dict(filters or {})
             current_req_url = next_url or url
 
@@ -239,6 +373,19 @@ class ThirdPartyExtractionClient:
                 page_params['limit'] = page_size
                 page_params['_page'] = page
                 page_params['_limit'] = page_size
+
+            # Cycle detection for cursor and next_url to prevent infinite loops
+            if next_cursor:
+                if next_cursor in visited_cursors:
+                    logger.warning("Repeated pagination cursor detected ('%s'). Terminating to prevent infinite loop.", next_cursor)
+                    break
+                visited_cursors.add(next_cursor)
+
+            if next_url and next_url != url:
+                if next_url in visited_urls:
+                    logger.warning("Repeated pagination URL detected ('%s'). Terminating to prevent infinite loop.", next_url)
+                    break
+                visited_urls.add(next_url)
 
             response = self._execute_request_with_retries(current_req_url, headers, page_params)
             status_code = response.status_code
@@ -322,26 +469,49 @@ class ThirdPartyExtractionClient:
                     all_records.append(norm)
                     new_in_page += 1
 
+            # Notify heartbeat callback after successfully fetching and ingesting page
+            if heartbeat_callback:
+                try:
+                    heartbeat_callback()
+                except Exception as exc:
+                    logger.debug("Heartbeat callback exception ignored: %s", exc)
+
             # Detect cursor or next page link for subsequent requests
             next_cursor = None
+            next_url = None
+            has_paging_block = False
             if isinstance(payload, dict):
                 # HubSpot style: {"paging": {"next": {"after": "..."}}}
-                paging = payload.get('paging')
-                if isinstance(paging, dict):
-                    next_obj = paging.get('next')
-                    if isinstance(next_obj, dict):
-                        next_cursor = next_obj.get('after')
+                if 'paging' in payload:
+                    has_paging_block = True
+                    paging = payload.get('paging')
+                    if isinstance(paging, dict):
+                        next_obj = paging.get('next')
+                        if isinstance(next_obj, dict):
+                            next_cursor = next_obj.get('after')
                 # Generic cursor style: {"next_cursor": "..."} or {"cursor": "..."}
                 if not next_cursor:
-                    next_cursor = payload.get('next_cursor') or payload.get('cursor')
+                    if 'next_cursor' in payload or 'cursor' in payload:
+                        has_paging_block = True
+                        next_cursor = payload.get('next_cursor') or payload.get('cursor')
 
                 # Next URL style (RFC 5988 / REST next link)
                 links = getattr(response, 'links', None)
                 link_next = links.get('next', {}).get('url') if isinstance(links, dict) else None
                 next_url = payload.get('next') if isinstance(payload.get('next'), str) else link_next
 
-            # If cursor pagination is active and no next cursor was found, terminate
+            # If cursor pagination is detected or was active
+            if has_paging_block or next_cursor:
+                pagination_type = 'cursor'
+
+            # If cursor pagination is active and no next cursor was returned, terminate
             if pagination_type == 'cursor' and not next_cursor:
+                break
+
+            # If next URL pagination is active
+            if next_url and next_url != current_req_url:
+                pagination_type = 'next_url'
+            elif pagination_type == 'next_url' and not next_url:
                 break
 
             # If no new records were extracted on this page, stop to prevent infinite loops

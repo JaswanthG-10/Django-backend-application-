@@ -62,6 +62,7 @@ class JobStatusResponseSerializer(serializers.ModelSerializer):
             'retry_count',
             'max_retries',
             'start_time',
+            'heartbeat_at',
             'end_time',
             'duration_seconds',
             'progress_percentage',

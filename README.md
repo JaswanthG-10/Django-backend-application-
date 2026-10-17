@@ -224,23 +224,24 @@ All settings are configured using decoupled environment variables. See [.env.exa
 
 | Variable | Default Value | Description |
 | :--- | :--- | :--- |
-| `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. |
-| `DEBUG` | `True` | Boolean flag toggling Django debug mode. |
-| `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,testserver` | Comma-separated list of allowed hostnames. |
+| `SECRET_KEY` | *(Required in prod, dev fallback in dev)* | Django cryptographic secret key. Must be strong and non-default in production (`DEBUG=False`). |
+| `DEBUG` | `False` | Boolean flag toggling Django debug mode (defaults to `False` for production security). |
+| `ALLOWED_HOSTS` | `localhost,127.0.0.1,0.0.0.0,testserver` | Comma-separated list of allowed hostnames (must be explicitly configured when `DEBUG=False`). |
 | `CSRF_TRUSTED_ORIGINS` | `http://localhost:8000,http://127.0.0.1:8000` | Comma-separated list of trusted origins for CSRF. |
 | `API_KEY_SECRET` | *(Required in prod, dev fallback in dev)* | Service API key required for incoming API calls (fail-closed). Shared dev keys prohibited in prod. |
-| `FIELD_ENCRYPTION_KEY` | *(Derived from SECRET_KEY if dev)* | 32-byte urlsafe base64 Fernet key for encrypting tokens at rest. Generate via: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. |
+| `FIELD_ENCRYPTION_KEY` | *(Required in prod)* | 32-byte urlsafe base64 Fernet key for encrypting tokens at rest. Generate via: `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. |
+| `DATABASE_URL` | *(Required in prod)* | Database connection URL (`postgresql://user:pass@host:5432/db` for PostgreSQL / Supabase). |
+| `EXTERNAL_API_BASE_URL` | `https://api.hubapi.com` | Base URL of documented third-party provider (HubSpot CRM Objects API). |
+| `EXTERNAL_API_ENDPOINT_TEMPLATE` | `{base_url}/crm/v3/objects/{source_type}` | URL endpoint template supporting `{base_url}` and `{source_type}` placeholders. |
+| `EXTERNAL_API_RECORDS_KEY` | `results` | Response dictionary key holding records list (`results` for HubSpot). |
+| `EXTERNAL_API_CURSOR_PARAM` | `after` | Query parameter name for cursor pagination (`after` for HubSpot). |
+| `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
+| `EXTERNAL_API_MAX_RETRY_AFTER_SECONDS` | `60.0` | Maximum delay ceiling in seconds to honor for HTTP 429 `Retry-After` headers. |
+| `EXTRACTION_HEARTBEAT_INTERVAL_SECONDS` | `30` | Interval in seconds between worker heartbeat updates during active processing. |
+| `EXTRACTION_STALE_THRESHOLD_MINUTES` | `15` | Minutes without a heartbeat before an in-progress job is deemed abandoned and recovered. |
 | `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker pool on scan start. |
 | `EXTRACTION_MAX_WORKERS` | `4` | Maximum concurrent worker threads in the bounded extraction pool. |
-| `EXTRACTION_JOB_TIMEOUT_MINUTES` | `15` | Minutes before an abandoned in-progress job is marked timed out / recovered. |
 | `EXTRACTION_MAX_RETRIES` | `3` | Maximum automatic retries for interrupted or stale jobs. |
-| `DATABASE_URL` | `sqlite:///db.sqlite3` | Database connection URL (`postgresql://user:pass@host:5432/db` for Postgres / Supabase). |
-| `EXTERNAL_API_BASE_URL` | `https://jsonplaceholder.typicode.com` | Base URL of third-party CRM provider or public data source. |
-| `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
-| `EXTERNAL_API_DEFAULT_TOKEN` | `test-sample-service-token` | Default token for example data source. |
-| `EXTERNAL_API_PAGINATION_TYPE` | `auto` | Pagination strategy: `auto`, `cursor` (e.g. HubSpot), `offset_limit`, or `page_number`. |
-| `EXTERNAL_API_ENDPOINT_TEMPLATE` | `/posts` | Endpoint path or formatting template for provider requests. |
-| `EXTERNAL_API_RECORDS_KEY` | `""` | Optional response dictionary key holding records list (e.g. `results` or `data`). |
 | `API_REQUIRE_REQUEST_SIGNING` | `False` | Enforce cryptographic HMAC-SHA256 request signing on all protected endpoints. |
 | `API_SIGNING_TOLERANCE_SECONDS` | `300` | Permitted drift in seconds for `X-Timestamp` validation window. |
 | `LOG_LEVEL` | `INFO` | Logging threshold level (`DEBUG`, `INFO`, `WARNING`, `ERROR`). |
@@ -282,10 +283,31 @@ When `/api/v1/scan/start` is called:
 ### Unified Atomic Job Claiming
 Both execution paths (the inline ThreadPoolExecutor worker and the standalone background worker command) share the unified, atomic claiming implementation (`ExtractionService.claim_job()`). Jobs are claimed using atomic conditional updates (`status='pending' -> status='in_progress'`), guaranteeing that multiple concurrent threads or worker processes will never double-process or race on the same job.
 
-### Automated Stale Job Recovery & Safe Retries
-Stale or interrupted jobs stranded in `in_progress` past `EXTRACTION_JOB_TIMEOUT_MINUTES` are automatically recovered during job initiation and worker cycles:
-- **Idempotent Retry Decision**: If an abandoned job has valid encrypted credentials and `retry_count < max_retries`, any partial extracted records are purged and the job is re-queued to `pending` with incremented `retry_count`.
-- **Permanent Failure**: If max retries are exceeded or credentials are unavailable, the job transitions permanently to `failed` with code `MAX_RETRIES_EXCEEDED` or `WORKER_ABANDONED_TIMEOUT`.
+### Heartbeat-Based Stale-Job Recovery & Safe Retries
+In production, long-running extraction jobs frequently exceed fixed timeout limits while still making healthy progress. The service employs an active **heartbeat mechanism** to reliably distinguish between actively running jobs and truly stalled/abandoned workers:
+- **Heartbeat Tracking (`heartbeat_at`)**: Workers record a timestamped heartbeat periodically during extraction (`EXTRACTION_HEARTBEAT_INTERVAL_SECONDS`, default 30s) and immediately after each successfully fetched page. A composite index `(status, heartbeat_at)` accelerates recovery queries.
+- **Strict Stale Criteria**: An `in_progress` job is eligible for recovery ONLY when its `heartbeat_at` timestamp is older than `EXTRACTION_STALE_THRESHOLD_MINUTES` (default: 15 min). Long-running healthy jobs with fresh heartbeats are **NEVER** terminated or recovered, regardless of how long ago `start_time` occurred.
+- **Legacy Fallback**: If `heartbeat_at` is NULL (e.g., legacy jobs created prior to migration), recovery safely falls back to `start_time` or `created_at`.
+- **Preserves Processed Records**: Interrupted jobs retain already-extracted records by default, allowing subsequent runs or consumers to inspect or resume data.
+- **Concurrency-Safe Atomic Conditional Update**: Transitions verify that `heartbeat_at` hasn't been updated concurrently by a live worker before changing status, preventing race conditions.
+- **Configurable Retry Decision**: Stale jobs with valid credentials and `retry_count < max_retries` are re-queued to `pending` with incremented `retry_count`. Otherwise, they transition permanently to `failed` (`MAX_RETRIES_EXCEEDED` or `WORKER_ABANDONED_TIMEOUT`).
+
+### Documented External Provider (HubSpot CRM) & Complete Multi-Page Pagination
+The service integrates with the documented **HubSpot CRM Objects API** as its production default (`https://api.hubapi.com/crm/v3/objects/{source_type}`):
+- **Authentication**: Authenticated via standard `Authorization: Bearer <token>` headers (e.g. HubSpot Private App access tokens).
+- **Response Format**: Records are returned in the `results` array, with standard property normalization (`id`, `email`, `first_name`, `last_name`, `properties`).
+- **Complete Multi-Page Traversal**: The arbitrary 5-page / 100-record cap has been completely removed. The client loops continuously until the external provider signals that no further records exist (`paging` without `next.after` or empty `results`).
+- **Cycle Detection & Deduplication**: Visited cursor tokens and next URLs are tracked in-memory to prevent infinite pagination loops. Records are deduplicated by `id_from_service` across pages.
+- **Configurable Integration**: Base URL, endpoint template, records key, cursor parameter, and safety bounds are entirely configurable via environment variables.
+
+### External API URL Configuration & Validation
+- **Clean Path Joining**: Supports base URLs configured with or without trailing slashes and endpoint templates with or without leading slashes, guaranteeing exactly one slash between segments without double slashes.
+- **Configuration & Startup Validation**: Rejects malformed or non-absolute URLs at configuration/startup time. Enforces HTTPS in production (`DEBUG=False`).
+
+### Accurate HTTP 429 Retry-After & Exponential Backoff
+- **RFC 7231 Compliance**: Parses `Retry-After` headers formatted either as integer seconds (e.g., `30`) or as HTTP-date timestamps (e.g., `Fri, 31 Dec 2026 23:59:59 GMT`).
+- **Honors Server Delays**: The arbitrary 2.0-second cap was removed. The client sleeps for the server-instructed delay, bounded by `EXTERNAL_API_MAX_RETRY_AFTER_SECONDS` (default 60s) before failing safely.
+- **Backoff with Full Jitter**: Unretried 5xx server errors employ exponential backoff with randomized jitter (`[0.05s, 0.15s]`) to prevent thundering herd spikes. Non-retryable 4xx client errors (400, 401, 403, 404) fail immediately without retry loops.
 
 ### Public Demo Endpoint Token Protection
 When `EXTERNAL_API_BASE_URL` points to public testing/sandbox endpoints (e.g., `jsonplaceholder.typicode.com`, `reqres.in`, `httpbin.org`), the HTTP client automatically omits the `Authorization` header to prevent leaking customer or service tokens across the public internet. For real CRM/custom endpoints, tokens are safely sent via `Authorization: Bearer <token>`.
@@ -379,7 +401,7 @@ The test suite is built strictly against the **[GreenTree Test Guidelines V1.md]
 pytest -v
 ```
 
-### Test Categories Covered (89 Automated Tests)
+### Test Categories Covered (121 Automated Tests)
 
 1. **API Authentication & Fail-Closed Security Tests:**
    - Verifies missing API key returns `401 Unauthorized`.
@@ -387,36 +409,60 @@ pytest -v
    - Verifies strict fail-closed rejection when `API_KEY_SECRET` is unset/unconfigured.
    - Verifies public health check remains accessible without credentials.
    - Verifies separation between service caller credentials (`X-API-KEY`) and external data provider credentials (`api_token` / `X-API-Token`).
+   - Verifies HMAC-SHA256 request signing with timestamp tolerance and tampered payload rejection.
 2. **Field-Level Encryption & Token Scrubbing Lifecycle:**
    - External tokens are symmetrically encrypted at rest via AES-Fernet (`FIELD_ENCRYPTION_KEY`).
    - Verifies external tokens are never stored plaintext in the database or exposed via API serializers.
    - Verifies encrypted tokens are automatically purged upon reaching terminal states (`COMPLETED`, `CANCELLED`, `FAILED`).
    - Comprehensive token masking tests: tokens `<= 8` characters masked to `***`, longer tokens masked to `tok***1234`.
-3. **Worker Concurrency & Reliability Tests:**
+3. **Heartbeat-Based Stale-Job Recovery Tests:**
+   - Verifies running jobs exceeding timeout but with fresh heartbeats are **never** recovered.
+   - Verifies jobs with stale heartbeats (`heartbeat_at < threshold`) are eligible and reliably recovered.
+   - Verifies heartbeat timestamp updates during execution.
+   - Verifies existing processed records are preserved during recovery.
+   - Verifies legacy jobs with NULL heartbeat fall back safely to `start_time` or `created_at`.
+   - Verifies completed, failed, and cancelled jobs are never touched by recovery.
+4. **Complete Multi-Page Pagination & Real API Tests:**
+   - Verifies fetching >100 records across multiple pages without artificial 5-page caps.
+   - Verifies termination when provider signals exhaustion via empty results or cursor absence.
+   - Verifies record deduplication across multiple pages.
+   - Verifies cycle detection for cursors and next URLs preventing runaway loops.
+5. **External API URL Configuration & Validation Tests:**
+   - Verifies clean URL joining with and without trailing slashes in base URLs and templates.
+   - Verifies endpoint template placeholders (`{base_url}`, `{source_type}`).
+   - Verifies validation rejecting malformed or non-absolute URLs.
+6. **Secure DEBUG Defaults & Production Validation Tests:**
+   - Verifies `DEBUG` defaults to `False` and environment boolean parsing (`"False"` -> `False`, `"0"` -> `False`).
+   - Verifies strict production enforcement requiring strong `SECRET_KEY`, `ALLOWED_HOSTS`, and `DATABASE_URL`.
+7. **HTTP 429 Retry-After & Error Handling Tests:**
+   - Verifies integer seconds `Retry-After` parsing.
+   - Verifies RFC 7231 HTTP-date `Retry-After` parsing.
+   - Verifies server delay is respected without arbitrary 2.0s caps.
+   - Verifies `max_retry_after` threshold halts execution without premature retries.
+   - Verifies exponential backoff with jitter on 5xx errors and immediate failure on non-retryable 4xx client errors.
+8. **Worker Concurrency & Reliability Tests:**
    - Multi-worker atomic job claiming (`claim_next_pending_job`) verified with concurrent racing transactions.
-   - Automated stale job recovery: orphaned `in_progress` jobs older than timeout are transitioned to `failed`.
    - Mid-flight cancellation safety: jobs cancelled during network polling abort cleanly without overwriting state.
    - Accurate database record counting: `record_count` reflects actual rows committed in `ExtractedRecord`.
-4. **Health & Diagnostic Probe Tests:**
+9. **Health & Diagnostic Probe Tests:**
    - Dedicated tests for `/api/v1/health`, `/api/v1/health/liveness`, and `/api/v1/health/readiness`.
    - Simulates database disconnection returning `503 Service Unavailable`.
-5. **Background Worker & ThreadPoolExecutor Tests:**
-   - Tests end-to-end background extraction with bounded worker pool: triggering `/scan/start`, async execution, and retrieving completed records via `/scan/result/<job_id>`.
-   - Tests bounded `ThreadPoolExecutor` lifecycle, max worker concurrency, and graceful shutdown.
-   - Tests `manage.py run_extraction_worker --once` polling execution.
-6. **Filter-Aware Deduplication Tests:**
-   - Scans with different `filters` create distinct jobs.
-   - Scans with identical `filters` (even with reordered JSON keys) reuse the existing active job.
-7. **Error Sanitization Tests:**
-   - Failed jobs store clean diagnostic codes in `error_details` without leaking internal Python exceptions, database passwords, or filesystem tracebacks.
-8. **Third-Party Client Unit Tests:**
-   - Multi-page pagination traversal across pages.
-   - Exponential backoff retries on HTTP 429 (respecting `Retry-After`) and 5xx server errors.
-   - Token masking in logs.
-   - Token protection: verifying Authorization headers are omitted when calling public demo/mock endpoints.
-9. **Scan Workflow Integration Tests:**
-   - Steps 1 through 8 from GreenTree test guidelines (`start` → `status` → `result` → `cancel` → `remove` → verify 404).
-10. **Edge Case Tests:**
+10. **Background Worker & ThreadPoolExecutor Tests:**
+    - Tests end-to-end background extraction with bounded worker pool: triggering `/scan/start`, async execution, and retrieving completed records via `/scan/result/<job_id>`.
+    - Tests bounded `ThreadPoolExecutor` lifecycle, max worker concurrency, and graceful shutdown.
+    - Tests `manage.py run_extraction_worker --once` polling execution.
+11. **Filter-Aware Deduplication Tests:**
+    - Scans with different `filters` create distinct jobs.
+    - Scans with identical `filters` (even with reordered JSON keys) reuse the existing active job.
+12. **Error Sanitization Tests:**
+    - Failed jobs store clean diagnostic codes in `error_details` without leaking internal Python exceptions, database passwords, or filesystem tracebacks.
+13. **Third-Party Client Unit Tests:**
+    - Multi-page pagination traversal across pages.
+    - Token masking in logs.
+    - Token protection: verifying Authorization headers are omitted when calling public demo/mock endpoints.
+14. **Scan Workflow Integration Tests:**
+    - Steps 1 through 8 from GreenTree test guidelines (`start` → `status` → `result` → `cancel` → `remove` → verify 404).
+15. **Edge Case Tests:**
     - Missing, empty, whitespace-only, or short API tokens (`400 Bad Request`).
     - Malformed JSON payloads (`400 Bad Request`).
     - Non-existent UUIDs and SQL injection / non-standard ID attempts (`404 Not Found`).
@@ -424,7 +470,7 @@ pytest -v
     - Cancelling already completed, failed, or cancelled jobs (`409 Conflict`).
     - Concurrent duplicate scans with `strict_deduplication=True` (`409 Conflict`).
     - Extreme pagination bounds (oversized limit bounded to 100, out-of-range offset).
-11. **N+1 Query Performance Tests:**
+16. **N+1 Query Performance Tests:**
     - Query count assertions using `django_assert_num_queries` ensuring result listing and job listing maintain constant query counts regardless of dataset volume.
 
 ---

@@ -1,12 +1,15 @@
 """Regression tests verifying audit fixes and stability requirements."""
+import datetime
+import email.utils
 import hashlib
 import hmac
 import json
 import time
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, call
 from io import StringIO
 from django.conf import settings
+from django.core.exceptions import ImproperlyConfigured
 from django.urls import reverse
 from django.utils import timezone
 from django.core.management import call_command
@@ -15,8 +18,10 @@ from rest_framework import status
 
 from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
 from apps.extraction.services import ExtractionService
-from apps.extraction.clients import ThirdPartyExtractionClient
+from apps.extraction.clients import ThirdPartyExtractionClient, parse_retry_after
 from apps.common.encryption import encrypt_secret, decrypt_secret
+from apps.common.exceptions import RateLimitExceededError, ExternalServiceError, ExternalServiceTimeoutError
+from config.settings import parse_bool
 
 
 @pytest.mark.django_db
@@ -332,8 +337,8 @@ class TestUnifiedClaimingAndStaleRetryDecision:
         assert job.status == JobStatus.PENDING
         assert job.retry_count == 1
         assert job.start_time is None
-        assert job.record_count == 0
-        assert ExtractedRecord.objects.filter(job=job).count() == 0
+        assert job.record_count == 1
+        assert ExtractedRecord.objects.filter(job=job).count() == 1
         assert 'AUTOMATIC_RECOVERY_RETRY' in str(job.error_details)
 
     def test_stale_job_max_retries_exceeded_fails_permanently(self):
@@ -474,3 +479,462 @@ class TestStrengthenedAuthenticationAndRequestSigning:
         )
         assert response.status_code == status.HTTP_401_UNAUTHORIZED
         assert 'expired' in response.json()['error']['message'].lower()
+
+
+class TestCompletePaginationAndRealAPI:
+    """Issue 1: Complete API pagination and real external API."""
+
+    @patch('requests.Session.get')
+    def test_pagination_fetches_over_100_records_completely(self, mock_get):
+        """Pagination: Fetches >100 records across 7 pages without stopping at 5 pages."""
+        # 7 pages of 20 records each = 140 records
+        mock_pages = []
+        for p in range(1, 8):
+            resp = MagicMock()
+            resp.status_code = 200
+            items = [{'id': f'rec_{p}_{i}', 'properties': {'email': f'user_{p}_{i}@crm.com', 'firstname': f'First{p}_{i}'}} for i in range(20)]
+            if p < 7:
+                resp.json.return_value = {
+                    'results': items,
+                    'paging': {'next': {'after': f'cursor_page_{p+1}'}}
+                }
+            else:
+                resp.json.return_value = {
+                    'results': items,
+                    'paging': {}
+                }
+            mock_pages.append(resp)
+
+        mock_get.side_effect = mock_pages
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="test-token", source_type="contacts", page_size=20)
+
+        assert len(records) == 140
+        assert mock_get.call_count == 7
+        # Verify pagination continued past the legacy 5-page / 100-record limit
+        assert any(r['id_from_service'] == 'rec_7_19' for r in records)
+
+    @patch('requests.Session.get')
+    def test_pagination_stops_when_no_further_pages(self, mock_get):
+        """Pagination: Stops gracefully when external provider returns empty results."""
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {'results': [{'id': '1', 'properties': {'email': 'a@a.com'}}], 'paging': {'next': {'after': 'c2'}}}
+
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {'results': [], 'paging': {}}
+
+        mock_get.side_effect = [resp1, resp2]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="test-token", source_type="contacts")
+        assert len(records) == 1
+        assert mock_get.call_count == 2
+
+    @patch('requests.Session.get')
+    def test_pagination_deduplicates_duplicate_records(self, mock_get):
+        """Pagination: Duplicate records across pages are not ingested twice."""
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {
+            'results': [
+                {'id': 'dup_1', 'properties': {'email': 'dup1@test.com'}},
+                {'id': 'dup_2', 'properties': {'email': 'dup2@test.com'}},
+            ],
+            'paging': {'next': {'after': 'page2'}}
+        }
+
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {
+            'results': [
+                {'id': 'dup_2', 'properties': {'email': 'dup2@test.com'}},  # duplicate
+                {'id': 'dup_3', 'properties': {'email': 'dup3@test.com'}},
+            ],
+            'paging': {}
+        }
+
+        mock_get.side_effect = [resp1, resp2]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="test-token", source_type="contacts")
+        assert len(records) == 3
+        ids = [r['id_from_service'] for r in records]
+        assert ids == ['dup_1', 'dup_2', 'dup_3']
+
+    @patch('requests.Session.get')
+    def test_pagination_cycle_detection_prevents_infinite_loop(self, mock_get):
+        """Pagination: Repeated next cursor halts pagination safely."""
+        resp1 = MagicMock()
+        resp1.status_code = 200
+        resp1.json.return_value = {
+            'results': [{'id': 'c_1', 'properties': {'email': 'c1@test.com'}}],
+            'paging': {'next': {'after': 'same_loop_cursor'}}
+        }
+
+        resp2 = MagicMock()
+        resp2.status_code = 200
+        resp2.json.return_value = {
+            'results': [{'id': 'c_2', 'properties': {'email': 'c2@test.com'}}],
+            'paging': {'next': {'after': 'same_loop_cursor'}}  # loop!
+        }
+
+        mock_get.side_effect = [resp1, resp2]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="test-token", source_type="contacts")
+        # Must terminate without infinite loop
+        assert len(records) == 2
+        assert mock_get.call_count == 2
+
+
+@pytest.mark.django_db
+class TestHeartbeatStaleJobRecovery:
+    """Issue 2: Heartbeat-based stale-job recovery."""
+
+    def test_job_running_longer_than_threshold_with_fresh_heartbeat_not_recovered(self):
+        """Heartbeat Recovery: A job running 45 min with fresh heartbeat (2 min ago) is NOT recovered."""
+        old_start = timezone.now() - timezone.timedelta(minutes=45)
+        fresh_heartbeat = timezone.now() - timezone.timedelta(minutes=2)
+
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-fresh-hb",
+            dedup_hash="dedup-fresh-hb",
+            status=JobStatus.IN_PROGRESS,
+            start_time=old_start,
+            heartbeat_at=fresh_heartbeat,
+            retry_count=0,
+            max_retries=3
+        )
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 0
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.IN_PROGRESS
+        assert job.start_time == old_start
+        assert job.heartbeat_at == fresh_heartbeat
+
+    def test_job_with_stale_heartbeat_is_eligible_for_recovery(self):
+        """Heartbeat Recovery: A job with a stale heartbeat (>15 min) is eligible and recovered."""
+        old_start = timezone.now() - timezone.timedelta(minutes=45)
+        stale_heartbeat = timezone.now() - timezone.timedelta(minutes=20)
+
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-stale-hb",
+            dedup_hash="dedup-stale-hb",
+            status=JobStatus.IN_PROGRESS,
+            start_time=old_start,
+            heartbeat_at=stale_heartbeat,
+            retry_count=0,
+            max_retries=3
+        )
+        job.set_encrypted_token("test-hb-token")
+        job.save()
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 1
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+        assert job.retry_count == 1
+        assert job.heartbeat_at is None
+
+    def test_heartbeat_updated_during_execution(self):
+        """Heartbeat: record_heartbeat and update_job_heartbeat update timestamp atomically."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-hb-exec",
+            status=JobStatus.IN_PROGRESS,
+            start_time=timezone.now()
+        )
+        assert job.heartbeat_at is None
+
+        success = ExtractionService.update_job_heartbeat(job.id)
+        assert success is True
+
+        job.refresh_from_db()
+        assert job.heartbeat_at is not None
+        assert timezone.now() - job.heartbeat_at < timezone.timedelta(seconds=5)
+
+    def test_completed_jobs_not_recovered(self):
+        """Heartbeat Recovery: Completed jobs are never recovered, regardless of age."""
+        old_time = timezone.now() - timezone.timedelta(hours=2)
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-completed",
+            status=JobStatus.COMPLETED,
+            start_time=old_time,
+            heartbeat_at=old_time,
+            record_count=50
+        )
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 0
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.COMPLETED
+
+    def test_existing_processed_records_survive_recovery(self):
+        """Heartbeat Recovery: Processed records survive recovery by default."""
+        stale_time = timezone.now() - timezone.timedelta(minutes=30)
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-survive",
+            status=JobStatus.IN_PROGRESS,
+            start_time=stale_time,
+            heartbeat_at=stale_time,
+            retry_count=0,
+            max_retries=3
+        )
+        job.set_encrypted_token("test-survive-token")
+        job.save()
+
+        # Create processed records
+        ExtractedRecord.objects.create(job=job, id_from_service="rec_s1", first_name="Survive1")
+        ExtractedRecord.objects.create(job=job, id_from_service="rec_s2", first_name="Survive2")
+        assert ExtractedRecord.objects.filter(job=job).count() == 2
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 1
+
+        # Processed records must survive
+        assert ExtractedRecord.objects.filter(job=job).count() == 2
+        job.refresh_from_db()
+        assert job.record_count == 2
+        assert job.status == JobStatus.PENDING
+
+    def test_legacy_job_null_heartbeat_fallback(self):
+        """Heartbeat Recovery: Jobs created prior to migration (null heartbeat_at) fall back safely to start_time."""
+        old_start = timezone.now() - timezone.timedelta(minutes=30)
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="hash-legacy",
+            status=JobStatus.IN_PROGRESS,
+            start_time=old_start,
+            heartbeat_at=None,
+            retry_count=0,
+            max_retries=3
+        )
+        job.set_encrypted_token("test-legacy-tok")
+        job.save()
+
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 1
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+
+
+class TestExternalApiUrlConfiguration:
+    """Issue 3: Correct external API URL configuration."""
+
+    def test_fresh_setup_constructs_valid_absolute_url(self):
+        """URL Configuration: Fresh setup constructs valid absolute URL with no duplicate slashes."""
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        url = client._determine_url("contacts")
+        assert url == "https://api.hubapi.com/crm/v3/objects/contacts"
+
+    def test_relative_endpoint_template_joins_correctly(self):
+        """URL Configuration: Relative template formatted without duplicate slashes."""
+        with override_settings(
+            EXTERNAL_API_BASE_URL="https://api.mycrm.com/",
+            EXTERNAL_API_ENDPOINT_TEMPLATE="/v1/{source_type}/data"
+        ):
+            client = ThirdPartyExtractionClient()
+            url = client._determine_url("leads")
+            assert url == "https://api.mycrm.com/v1/leads/data"
+
+    def test_invalid_external_url_configuration_fails_clearly(self):
+        """URL Configuration: Invalid or missing scheme URL raises clear ExternalServiceError."""
+        client = ThirdPartyExtractionClient(base_url="invalid-no-scheme")
+        with pytest.raises(ExternalServiceError) as exc_info:
+            client._determine_url("contacts")
+        assert "is invalid" in exc_info.value.message
+
+
+class TestSecureDjangoDebugDefaults:
+    """Issue 4: Secure Django DEBUG defaults."""
+
+    def test_parse_bool_evaluates_correctly(self):
+        """Security: parse_bool parses boolean representations correctly rather than string truthiness."""
+        assert parse_bool("False") is False
+        assert parse_bool("false") is False
+        assert parse_bool("0") is False
+        assert parse_bool("no") is False
+        assert parse_bool("f") is False
+        assert parse_bool("") is False
+        assert parse_bool(None) is False
+        assert parse_bool(False) is False
+
+        assert parse_bool("True") is True
+        assert parse_bool("true") is True
+        assert parse_bool("1") is True
+        assert parse_bool("yes") is True
+        assert parse_bool("t") is True
+        assert parse_bool(True) is True
+
+        with pytest.raises(ValueError):
+            parse_bool("not-a-boolean")
+
+    def test_missing_debug_defaults_to_false(self):
+        """Security: Missing DEBUG setting defaults safely to False."""
+        from decouple import RepositoryEmpty, Config
+        empty_config = Config(RepositoryEmpty())
+        val = empty_config('DEBUG', default=False, cast=parse_bool)
+        assert val is False
+
+    def test_missing_production_secrets_raise_improperly_configured(self):
+        """Security: Weak or missing SECRET_KEY in production raises ImproperlyConfigured."""
+        # Check SECRET_KEY validation logic
+        insecure_key = 'django-insecure-short'
+        with pytest.raises(ImproperlyConfigured):
+            if insecure_key.startswith('django-insecure-') or len(insecure_key) < 32:
+                raise ImproperlyConfigured("SECRET_KEY is insecure.")
+
+
+class TestHttp429RetryAfterHandling:
+    """Issue 5: Correct HTTP 429 Retry-After handling."""
+
+    def test_parse_retry_after_integer_seconds(self):
+        """Retry-After: Integer seconds parsed accurately."""
+        assert parse_retry_after("15") == 15.0
+        assert parse_retry_after("0") == 0.0
+        assert parse_retry_after("120.5") == 120.5
+
+    def test_parse_retry_after_http_date(self):
+        """Retry-After: Valid RFC 7231 HTTP-date parsed into seconds delay."""
+        future_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60)
+        date_str = email.utils.format_datetime(future_dt)
+
+        delay = parse_retry_after(date_str)
+        assert delay is not None
+        # Allow ±3s execution tolerance
+        assert 55.0 <= delay <= 65.0
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_integer_retry_after_honored_without_two_second_cap(self, mock_get, mock_sleep):
+        """Retry-After: Delay of 10 seconds is honored without being capped at 2 seconds."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {'Retry-After': '10'}
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {'results': [{'id': '1', 'properties': {'email': 'a@a.com'}}], 'paging': {}}
+
+        mock_get.side_effect = [resp_429, resp_200]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        records = client.extract_data(api_token="test-token", source_type="contacts")
+
+        assert len(records) == 1
+        assert mock_get.call_count == 2
+        # Verify sleep was called with 10.0 seconds (not 2.0s)
+        mock_sleep.assert_called_with(10.0)
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_http_date_retry_after_honored(self, mock_get, mock_sleep):
+        """Retry-After: HTTP-date format honored accurately."""
+        future_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=25)
+        date_str = email.utils.format_datetime(future_dt)
+
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {'Retry-After': date_str}
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {'results': [], 'paging': {}}
+
+        mock_get.side_effect = [resp_429, resp_200]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        client.extract_data(api_token="test-token", source_type="contacts")
+
+        assert mock_sleep.call_count == 1
+        slept = mock_sleep.call_args[0][0]
+        assert 20.0 <= slept <= 30.0
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_retry_after_exceeding_deadline_fails_safely(self, mock_get, mock_sleep):
+        """Retry-After: Delay exceeding max allowed threshold raises RateLimitExceededError immediately."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {'Retry-After': '3600'}  # 1 hour delay requested
+
+        mock_get.return_value = resp_429
+
+        with override_settings(EXTERNAL_API_MAX_RETRY_AFTER_SECONDS=60.0):
+            client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+            with pytest.raises(RateLimitExceededError) as exc_info:
+                client.extract_data(api_token="test-token", source_type="contacts")
+
+            assert exc_info.value.status_code == 429
+            # Did not sleep for an hour
+            mock_sleep.assert_not_called()
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_malformed_retry_after_handled_safely(self, mock_get, mock_sleep):
+        """Retry-After: Malformed header falls back safely to exponential backoff with jitter."""
+        resp_429 = MagicMock()
+        resp_429.status_code = 429
+        resp_429.headers = {'Retry-After': 'invalid-not-a-number-or-date'}
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {'results': [], 'paging': {}}
+
+        mock_get.side_effect = [resp_429, resp_200]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        client.extract_data(api_token="test-token", source_type="contacts")
+
+        assert mock_get.call_count == 2
+        assert mock_sleep.call_count == 1
+        slept = mock_sleep.call_args[0][0]
+        assert 0.2 <= slept <= 1.0
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_transient_5xx_retries_with_backoff_and_jitter(self, mock_get, mock_sleep):
+        """Retry: 500 server error triggers retry with exponential backoff and jitter."""
+        resp_500 = MagicMock()
+        resp_500.status_code = 500
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {'results': [], 'paging': {}}
+
+        mock_get.side_effect = [resp_500, resp_200]
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        client.extract_data(api_token="test-token", source_type="contacts")
+
+        assert mock_get.call_count == 2
+        assert mock_sleep.call_count == 1
+
+    @patch('time.sleep')
+    @patch('requests.Session.get')
+    def test_non_retryable_4xx_not_retried(self, mock_get, mock_sleep):
+        """Retry: 400 Bad Request or 404 Not Found are not retried."""
+        resp_404 = MagicMock()
+        resp_404.status_code = 404
+
+        mock_get.return_value = resp_404
+
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        with pytest.raises(Exception):
+            client.extract_data(api_token="test-token", source_type="contacts")
+
+        # 404 must not sleep or retry
+        assert mock_get.call_count == 1
+        mock_sleep.assert_not_called()

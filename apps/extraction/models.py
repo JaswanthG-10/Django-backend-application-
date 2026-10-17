@@ -94,6 +94,12 @@ class ExtractionJob(models.Model):
         db_index=True,
         help_text="Timestamp when extraction processing began."
     )
+    heartbeat_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Timestamp of the most recent worker heartbeat while actively processing."
+    )
     end_time = models.DateTimeField(
         null=True,
         blank=True,
@@ -132,6 +138,7 @@ class ExtractionJob(models.Model):
             models.Index(fields=['token_hash', 'status'], name='job_token_status_idx'),
             models.Index(fields=['dedup_hash', 'status'], name='job_dedup_status_idx'),
             models.Index(fields=['source_type', 'status'], name='job_source_status_idx'),
+            models.Index(fields=['status', 'heartbeat_at'], name='job_status_heartbeat_idx'),
         ]
 
     def __str__(self) -> str:
@@ -241,6 +248,8 @@ class ExtractionJob(models.Model):
 
         if target_status == JobStatus.IN_PROGRESS and not self.start_time:
             self.start_time = now
+            self.heartbeat_at = now
+            update_fields.append('heartbeat_at')
         elif target_status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
             self.end_time = now
             self.clear_encrypted_token()
@@ -256,6 +265,15 @@ class ExtractionJob(models.Model):
             self.record_count = record_count
 
         self.save(update_fields=update_fields)
+
+    def record_heartbeat(self) -> None:
+        """Updates heartbeat timestamp in database atomically."""
+        now = timezone.now()
+        ExtractionJob.objects.filter(id=self.id, status=JobStatus.IN_PROGRESS).update(
+            heartbeat_at=now,
+            updated_at=now
+        )
+        self.heartbeat_at = now
 
 
 class ExtractedRecord(models.Model):

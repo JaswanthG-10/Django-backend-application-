@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Tuple, Optional, Dict, Any
 from uuid import UUID
 from django.conf import settings
-from django.db import transaction, connection
+from django.db import transaction, connection, models
 from django.utils import timezone
 from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
 from apps.extraction.selectors import get_job_by_id, get_active_job_by_dedup_hash
@@ -156,6 +156,7 @@ class ExtractionService:
             ).update(
                 status=JobStatus.IN_PROGRESS,
                 start_time=now,
+                heartbeat_at=now,
                 updated_at=now
             )
             if rows_updated == 1:
@@ -178,6 +179,7 @@ class ExtractionService:
         ).update(
             status=JobStatus.IN_PROGRESS,
             start_time=now,
+            heartbeat_at=now,
             updated_at=now
         )
 
@@ -193,69 +195,117 @@ class ExtractionService:
         return cls.claim_job()
 
     @classmethod
+    def update_job_heartbeat(cls, job_id: UUID) -> bool:
+        """Atomically updates the heartbeat timestamp for an active in-progress job."""
+        now = timezone.now()
+        rows = ExtractionJob.objects.filter(
+            id=job_id,
+            status=JobStatus.IN_PROGRESS
+        ).update(heartbeat_at=now, updated_at=now)
+        return rows > 0
+
+    @classmethod
     def recover_stale_jobs(cls, timeout_minutes: Optional[int] = None, allow_retry: bool = True) -> int:
-        """Identifies and recovers stale/abandoned in_progress jobs automatically.
+        """Identifies and recovers stale/abandoned in_progress jobs automatically using heartbeats.
         
-        Decides whether interrupted jobs can safely be retried or should permanently fail:
-        - If the job has valid encrypted credentials and retry_count < max_retries,
-          it cleans up any partial records for idempotency and resets the job to PENDING.
-        - If max retries have been reached or credentials cannot be recovered,
-          it permanently transitions the job to FAILED.
+        Heartbeat-based recovery criteria:
+        - A running job is stale only when its heartbeat_at timestamp is older than the configured threshold.
+        - If heartbeat_at is NULL (e.g. legacy jobs created before heartbeat migration), safely falls back
+          to start_time or created_at.
+        - Healthy jobs running longer than the threshold with fresh heartbeats are NEVER recovered.
+        - Preserves processed records by default: existing extracted records are NOT deleted.
+        - Concurrency safe: atomic conditional updates prevent race conditions with active workers.
         """
-        minutes = timeout_minutes or getattr(settings, 'EXTRACTION_JOB_TIMEOUT_MINUTES', 15)
+        minutes = timeout_minutes or getattr(settings, 'EXTRACTION_STALE_THRESHOLD_MINUTES', getattr(settings, 'EXTRACTION_JOB_TIMEOUT_MINUTES', 15))
         max_retries_setting = getattr(settings, 'EXTRACTION_MAX_RETRIES', 3)
         threshold = timezone.now() - timezone.timedelta(minutes=minutes)
-        stale_jobs = list(ExtractionJob.objects.filter(
-            status=JobStatus.IN_PROGRESS,
-            start_time__lt=threshold
-        ))
+
+        # Stale query: IN_PROGRESS jobs where heartbeat_at < threshold (or legacy fallback)
+        stale_query = models.Q(status=JobStatus.IN_PROGRESS) & (
+            models.Q(heartbeat_at__isnull=False, heartbeat_at__lt=threshold) |
+            models.Q(heartbeat_at__isnull=True, start_time__isnull=False, start_time__lt=threshold) |
+            models.Q(heartbeat_at__isnull=True, start_time__isnull=True, created_at__lt=threshold)
+        )
+        stale_jobs = list(ExtractionJob.objects.filter(stale_query))
         recovered_count = 0
+
         for job in stale_jobs:
+            last_activity = job.heartbeat_at or job.start_time or job.created_at
             logger.warning(
-                "Recovering stale abandoned extraction job %s (started %s, retry %d/%d)",
-                job.id, job.start_time, job.retry_count, job.max_retries or max_retries_setting
+                "Recovering stale abandoned extraction job %s (last active: %s, threshold: %d min, retry %d/%d)",
+                job.id, last_activity, minutes, job.retry_count, job.max_retries or max_retries_setting
             )
             try:
                 can_retry = allow_retry and (job.retry_count < (job.max_retries or max_retries_setting)) and bool(job.encrypted_token)
+                now = timezone.now()
 
                 if can_retry:
-                    # Clean up partial records from interrupted run to guarantee idempotent retry
-                    ExtractedRecord.objects.filter(job=job).delete()
-                    job.record_count = 0
-                    job.retry_count += 1
-                    job.status = JobStatus.PENDING
-                    job.start_time = None
-                    job.end_time = None
-                    job.error_message = f"Job was interrupted and automatically recovered for retry attempt {job.retry_count}."
-                    job.error_details = {
-                        'code': 'AUTOMATIC_RECOVERY_RETRY',
-                        'retry_count': job.retry_count,
-                        'max_retries': job.max_retries or max_retries_setting,
-                        'recovered_at': timezone.now().isoformat()
+                    # Preserve existing processed records by default
+                    persisted_count = ExtractedRecord.objects.filter(job=job).count()
+
+                    # Concurrency-safe atomic conditional update
+                    filter_kwargs = {
+                        'id': job.id,
+                        'status': JobStatus.IN_PROGRESS,
                     }
-                    job.save(update_fields=[
-                        'status', 'retry_count', 'record_count',
-                        'start_time', 'end_time', 'error_message', 'error_details', 'updated_at'
-                    ])
-                    logger.info("Stale job %s safely recovered and re-queued to PENDING (retry %d)", job.id, job.retry_count)
-                    recovered_count += 1
+                    if job.heartbeat_at is not None:
+                        filter_kwargs['heartbeat_at'] = job.heartbeat_at
+                    else:
+                        filter_kwargs['heartbeat_at__isnull'] = True
+
+                    rows = ExtractionJob.objects.filter(**filter_kwargs).update(
+                        status=JobStatus.PENDING,
+                        retry_count=job.retry_count + 1,
+                        record_count=persisted_count,
+                        start_time=None,
+                        heartbeat_at=None,
+                        end_time=None,
+                        error_message=f"Job execution stalled (last heartbeat: {last_activity.isoformat() if last_activity else 'none'}). Interrupted and recovered for retry attempt {job.retry_count + 1}.",
+                        error_details={
+                            'code': 'AUTOMATIC_RECOVERY_RETRY',
+                            'retry_count': job.retry_count + 1,
+                            'max_retries': job.max_retries or max_retries_setting,
+                            'last_heartbeat': last_activity.isoformat() if last_activity else None,
+                            'recovered_at': now.isoformat()
+                        },
+                        updated_at=now
+                    )
+                    if rows == 1:
+                        logger.info("Stale job %s safely recovered and re-queued to PENDING (retry %d)", job.id, job.retry_count + 1)
+                        recovered_count += 1
                 else:
                     reason = "Max retries exceeded" if job.retry_count >= (job.max_retries or max_retries_setting) else "Missing recovery credentials"
                     code = 'MAX_RETRIES_EXCEEDED' if 'Max' in reason else 'WORKER_ABANDONED_TIMEOUT'
-                    job.transition_to(
-                        JobStatus.FAILED,
-                        error_message=f"Job timed out and was abandoned after {minutes} minutes ({reason}).",
+                    filter_kwargs = {
+                        'id': job.id,
+                        'status': JobStatus.IN_PROGRESS,
+                    }
+                    if job.heartbeat_at is not None:
+                        filter_kwargs['heartbeat_at'] = job.heartbeat_at
+                    else:
+                        filter_kwargs['heartbeat_at__isnull'] = True
+
+                    rows = ExtractionJob.objects.filter(**filter_kwargs).update(
+                        status=JobStatus.FAILED,
+                        end_time=now,
+                        error_message=f"Job timed out and was abandoned after {minutes} minutes of inactivity ({reason}).",
                         error_details={
                             'code': code,
                             'category': 'worker_failure',
                             'retry_count': job.retry_count,
                             'reason': reason,
-                            'threshold_minutes': minutes
-                        }
+                            'threshold_minutes': minutes,
+                            'last_heartbeat': last_activity.isoformat() if last_activity else None,
+                            'recovered_at': now.isoformat()
+                        },
+                        updated_at=now
                     )
-                    recovered_count += 1
+                    if rows == 1:
+                        logger.info("Stale job %s permanently transitioned to FAILED (%s)", job.id, reason)
+                        recovered_count += 1
             except Exception as exc:
                 logger.error("Failed to recover stale job %s: %s", job.id, exc)
+
         return recovered_count
 
     @transaction.atomic
@@ -349,16 +399,20 @@ class ExtractionService:
         elif job.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}:
             logger.warning("Attempted to process extraction on terminal job %s (status=%s)", job.id, job.status)
             return job
+        else:
+            job.record_heartbeat()
 
         try:
             if mock_records is not None:
                 records_data = mock_records
             else:
                 filters = job.metadata.get('filters', {})
+                heartbeat_cb = lambda: ExtractionService.update_job_heartbeat(job.id)
                 records_data = self.client.extract_data(
                     api_token=active_token,
                     source_type=job.source_type,
-                    filters=filters
+                    filters=filters,
+                    heartbeat_callback=heartbeat_cb
                 )
 
             # Check if job was cancelled while external network request was executing
@@ -369,6 +423,8 @@ class ExtractionService:
                     job.id
                 )
                 return job
+
+            job.record_heartbeat()
 
             # Persist extracted records using bulk_create
             record_objects = []

@@ -2,6 +2,8 @@
 
 Generated for GreenTree / Springer Capital backend development practical assignment.
 """
+import sys
+import urllib.parse
 from pathlib import Path
 from django.core.exceptions import ImproperlyConfigured
 from decouple import config, Csv
@@ -9,21 +11,44 @@ import dj_database_url
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Security Settings
-DEBUG = config('DEBUG', default=True, cast=bool)
+
+def parse_bool(val) -> bool:
+    """Robust boolean parser for environment variables."""
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return False
+    val_str = str(val).strip().lower()
+    if val_str in {'true', '1', 't', 'yes', 'y'}:
+        return True
+    if val_str in {'false', '0', 'f', 'no', 'n', ''}:
+        return False
+    raise ValueError(f"Invalid boolean value for environment variable: '{val}'")
+
+
+# Security Settings: Defaults to False in production
+DEBUG = config('DEBUG', default=False, cast=parse_bool)
 
 # In development/test mode, fall back to a clearly designated dummy key if unset.
-# In production (DEBUG=False), require an explicit SECRET_KEY.
+# In production (DEBUG=False), require an explicit, strong SECRET_KEY.
 _DEFAULT_DEV_SECRET = 'django-insecure-dev-fallback-key-for-local-testing-only-991823719238'
 SECRET_KEY = config('SECRET_KEY', default=_DEFAULT_DEV_SECRET if DEBUG else '')
-if not SECRET_KEY or (not DEBUG and SECRET_KEY == _DEFAULT_DEV_SECRET):
-    raise ImproperlyConfigured("SECRET_KEY environment variable must be set securely when running with DEBUG=False.")
+if not DEBUG:
+    if not SECRET_KEY:
+        raise ImproperlyConfigured("SECRET_KEY environment variable must be set securely when running with DEBUG=False.")
+    if SECRET_KEY == _DEFAULT_DEV_SECRET or SECRET_KEY.startswith('django-insecure-') or len(SECRET_KEY) < 32:
+        raise ImproperlyConfigured(
+            "A strong, unique SECRET_KEY of at least 32 characters must be configured in production (DEBUG=False). "
+            "Insecure default or fallback keys are strictly prohibited."
+        )
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
     default='localhost,127.0.0.1,0.0.0.0,testserver' if DEBUG else '',
     cast=Csv()
 )
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured("ALLOWED_HOSTS environment variable must be configured when running with DEBUG=False.")
 
 CSRF_TRUSTED_ORIGINS = config(
     'CSRF_TRUSTED_ORIGINS',
@@ -106,9 +131,18 @@ _db_config = dj_database_url.parse(
 if _disable_server_side_cursors:
     _db_config['DISABLE_SERVER_SIDE_CURSORS'] = True
 
-DATABASES = {
-    'default': _db_config
-}
+_is_test_runner = 'pytest' in sys.modules or (len(sys.argv) > 1 and sys.argv[1] == 'test')
+if _is_test_runner and _is_pooler:
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': ':memory:',
+        }
+    }
+else:
+    DATABASES = {
+        'default': _db_config
+    }
 
 # Password validation
 AUTH_PASSWORD_VALIDATORS = [
@@ -237,14 +271,32 @@ EXTRACTION_MAX_WORKERS = config('EXTRACTION_MAX_WORKERS', default=4, cast=int)
 EXTRACTION_JOB_TIMEOUT_MINUTES = config('EXTRACTION_JOB_TIMEOUT_MINUTES', default=15, cast=int)
 EXTRACTION_MAX_RETRIES = config('EXTRACTION_MAX_RETRIES', default=3, cast=int)
 
+# Heartbeat and Stale Job Recovery Configuration
+EXTRACTION_HEARTBEAT_INTERVAL_SECONDS = config('EXTRACTION_HEARTBEAT_INTERVAL_SECONDS', default=30, cast=int)
+EXTRACTION_STALE_THRESHOLD_MINUTES = config('EXTRACTION_STALE_THRESHOLD_MINUTES', default=15, cast=int)
+
 # External Extraction Service Client Configuration
-# Allows pointing to real CRM / third-party API providers (e.g. HubSpot, Salesforce, custom CRM, JSONPlaceholder)
-EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://jsonplaceholder.typicode.com')
+# Real, documented production default: HubSpot CRM API (https://developers.hubspot.com/docs/api/crm/contacts)
+# Fully configurable to other CRM or REST providers via environment variables.
+EXTERNAL_API_BASE_URL = config('EXTERNAL_API_BASE_URL', default='https://api.hubapi.com')
 EXTERNAL_API_TIMEOUT = config('EXTERNAL_API_TIMEOUT', default=10, cast=int)
-EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='test-sample-service-token')
+EXTERNAL_API_DEFAULT_TOKEN = config('EXTERNAL_API_DEFAULT_TOKEN', default='')
 EXTERNAL_API_PAGINATION_TYPE = config('EXTERNAL_API_PAGINATION_TYPE', default='auto')  # auto, cursor, page_number, offset_limit
-EXTERNAL_API_ENDPOINT_TEMPLATE = config('EXTERNAL_API_ENDPOINT_TEMPLATE', default='')
-EXTERNAL_API_RECORDS_KEY = config('EXTERNAL_API_RECORDS_KEY', default='')
+EXTERNAL_API_ENDPOINT_TEMPLATE = config('EXTERNAL_API_ENDPOINT_TEMPLATE', default='{base_url}/crm/v3/objects/{source_type}')
+EXTERNAL_API_RECORDS_KEY = config('EXTERNAL_API_RECORDS_KEY', default='results')
+EXTERNAL_API_CURSOR_PARAM = config('EXTERNAL_API_CURSOR_PARAM', default='after')
+EXTERNAL_API_MAX_RETRY_AFTER_SECONDS = config('EXTERNAL_API_MAX_RETRY_AFTER_SECONDS', default=60.0, cast=float)
+EXTERNAL_API_MAX_PAGES = config('EXTERNAL_API_MAX_PAGES', default=500, cast=int)
+
+# Validate external API base URL configuration
+if EXTERNAL_API_BASE_URL:
+    _parsed_base = urllib.parse.urlparse(EXTERNAL_API_BASE_URL)
+    if not _parsed_base.scheme or not _parsed_base.netloc:
+        raise ImproperlyConfigured(
+            f"EXTERNAL_API_BASE_URL must be a valid absolute URL with scheme and host. Got: '{EXTERNAL_API_BASE_URL}'"
+        )
+    if not DEBUG and _parsed_base.scheme != 'https':
+        raise ImproperlyConfigured("EXTERNAL_API_BASE_URL must use HTTPS in production (DEBUG=False).")
 
 # Production Security Headers (active when DEBUG=False)
 if not DEBUG:
