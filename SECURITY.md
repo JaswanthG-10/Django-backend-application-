@@ -30,6 +30,20 @@ Include the following in your report:
 
 ---
 
+## Secrets That Must Be Rotated Before Production Use
+
+> **CRITICAL SECURITY NOTICE**: Any secrets committed to this repository's earlier git history are compromised and must not be used in any production environment.
+
+Before deploying this service to production, you must generate and configure brand-new, unique secrets for each of the following:
+
+1. **`SECRET_KEY`**: Django cryptographic signing secret.
+2. **`API_KEY_SECRET`**: Ingestion and scan initiation API key / HMAC signing secret.
+3. **`FIELD_ENCRYPTION_KEY`**: 32-byte URL-safe base64 Fernet symmetric key for at-rest token encryption.
+4. **`EXTERNAL_API_DEFAULT_TOKEN`**: Third-party provider access token.
+5. **Database Password (`DATABASE_URL`)**: PostgreSQL database connection credentials.
+
+---
+
 ## Secret Rotation Procedures
 
 ### 1. Rotating `SECRET_KEY` (Django Session & Signing Secret)
@@ -62,37 +76,22 @@ The `API_KEY_SECRET` authenticates API clients via `X-API-KEY` or HMAC request s
 
 ---
 
-### 3. Rotating `FIELD_ENCRYPTION_KEY` (Fernet Field Encryption)
+### 3. Rotating `FIELD_ENCRYPTION_KEY` (MultiFernet Zero-Downtime Rotation)
 
-The `FIELD_ENCRYPTION_KEY` is a 32-byte URL-safe base64-encoded key used by `cryptography.fernet.Fernet` to encrypt sensitive credentials stored in the database (e.g. `ExtractionJob.encrypted_token`).
-
-Because existing database rows are encrypted with the active key, rotating this key requires a two-key re-encryption migration:
+The `FIELD_ENCRYPTION_KEY` encrypts sensitive external tokens stored in `ExtractionJob.encrypted_token`. The system natively supports zero-downtime key rotation using `cryptography.fernet.MultiFernet` with comma-separated keys.
 
 1. Generate a new 32-byte URL-safe base64 Fernet key:
    ```bash
    python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
    ```
-2. Temporarily configure both keys in the environment:
-   - `FIELD_ENCRYPTION_KEY`: The new key.
-   - `OLD_FIELD_ENCRYPTION_KEY`: The previous key.
-3. Run a re-encryption management script or data migration across all jobs with `encrypted_token`:
-   ```python
-   from cryptography.fernet import Fernet, MultiFernet
-   from apps.extraction.models import ExtractionJob
-
-   f_new = Fernet(new_key)
-   f_old = Fernet(old_key)
-
-   for job in ExtractionJob.objects.exclude(encrypted_token=''):
-       try:
-           decrypted = f_old.decrypt(job.encrypted_token.encode()).decode()
-           job.encrypted_token = f_new.encrypt(decrypted.encode()).decode()
-           job.save(update_fields=['encrypted_token'])
-       except Exception:
-           pass
+2. Set `FIELD_ENCRYPTION_KEY` in your production environment to a comma-separated list with the **new key first** and the **old key second**:
+   ```env
+   FIELD_ENCRYPTION_KEY=<new_primary_key>,<old_fallback_key>
    ```
-4. Verify all records decrypt cleanly under the new key.
-5. Remove `OLD_FIELD_ENCRYPTION_KEY` from the environment.
+   - **Encryption** always uses the first (primary) key.
+   - **Decryption** automatically attempts keys in order, successfully decrypting existing database tokens encrypted under the previous key.
+   - When a job token is accessed and saved or re-encrypted, it is written using the primary key.
+3. Once all legacy encrypted rows have been re-encrypted or the corresponding jobs have reached terminal status (at which point tokens are automatically purged), remove `<old_fallback_key>` from `FIELD_ENCRYPTION_KEY`.
 
 ---
 
@@ -103,3 +102,27 @@ Because existing database rows are encrypted with the active key, rotating this 
 3. Update `DATABASE_URL` in the production environment.
 4. Restart application processes.
 5. Revoke the old database user credentials.
+
+---
+
+## SSRF Hardening & Network Egress Controls
+
+The extraction client enforces strict network egress controls and anti-SSRF protections to defend internal network infrastructure:
+
+### 1. Host Allowlisting (`EXTERNAL_API_ALLOWED_HOSTS`)
+- **Default (`[]`)**: When empty, the client permits connections only to the hostname specified in `EXTERNAL_API_BASE_URL`.
+- **Configured list**: Set `EXTERNAL_API_ALLOWED_HOSTS` to a comma-separated list of permitted hostnames (e.g. `api.hubapi.com,crm-provider.com`). Any pagination next-URL or HTTP redirect target outside this allowlist is immediately rejected.
+
+### 2. Loopback Access Controls (`EXTERNAL_API_ALLOW_LOOPBACK`)
+- **Default (`False`)**: Loopback destinations (`127.0.0.1`, `localhost`, `[::1]`) are blocked.
+- **Local testing only**: `EXTERNAL_API_ALLOW_LOOPBACK=True` is permitted **only** when `DEBUG=True`.
+- **Production enforcement**: In production (`DEBUG=False`), setting `EXTERNAL_API_ALLOW_LOOPBACK=True` causes Django startup to fail immediately with `ImproperlyConfigured`.
+
+### 3. DNS Rebinding Defense (Anti-TOCTOU)
+- Target hostnames are resolved and validated once.
+- The validated IP is pinned to the connection via `PinnedIPAdapter`, preventing subsequent DNS rebinding attacks while preserving TLS SNI and certificate verification.
+- All resolved IP addresses are inspected: if any resolved address belongs to private, loopback, link-local, CGNAT (`100.64.0.0/10`), IPv6 ULA (`fc00::/7`), or cloud metadata ranges, the request fails closed.
+
+### 4. Redirect Following
+- HTTP redirects are followed manually up to a maximum of 3 hops (`allow_redirects=False`).
+- Each redirect target undergoes full SSRF validation, cycle detection, and `Authorization` header stripping on cross-host transitions.
