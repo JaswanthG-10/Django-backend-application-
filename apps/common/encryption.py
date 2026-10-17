@@ -12,6 +12,12 @@ logger = logging.getLogger('apps.common.encryption')
 _fernet_instance: Fernet | MultiFernet | None = None
 
 
+def reset_fernet() -> None:
+    """Clears the cached Fernet cipher instance. Useful during testing and key rotation."""
+    global _fernet_instance
+    _fernet_instance = None
+
+
 def get_fernet() -> Fernet | MultiFernet:
     """Returns a cached Fernet or MultiFernet cipher instance using FIELD_ENCRYPTION_KEY.
     
@@ -47,7 +53,10 @@ def get_fernet() -> Fernet | MultiFernet:
         return _fernet_instance
     except Exception as exc:
         logger.error("Failed to initialize Fernet cipher with provided FIELD_ENCRYPTION_KEY: %s", exc)
-        raise ImproperlyConfigured("Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte Fernet key.") from exc
+        raise ImproperlyConfigured(
+            "Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte Fernet key. "
+            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
 
 
 def encrypt_secret(plaintext: str) -> str:

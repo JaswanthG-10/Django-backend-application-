@@ -40,6 +40,9 @@ htmlcov/
 
 # Environment
 .env
+.env.local
+.env.*.local
+.env.bak*
 
 # IDE
 .vscode/

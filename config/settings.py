@@ -2,6 +2,8 @@
 
 Generated for GreenTree / Springer Capital backend development practical assignment.
 """
+import hashlib
+import hmac
 import sys
 import urllib.parse
 from pathlib import Path
@@ -27,6 +29,36 @@ def parse_bool(val) -> bool:
     raise ValueError(f"Invalid boolean value for environment variable: '{val}'")
 
 
+def _is_prohibited_hash(raw_value: str, prohibited_hashes: set[str]) -> bool:
+    """Compares the SHA-256 hash of a configured value against a set of prohibited hashes using constant-time comparison."""
+    if not raw_value:
+        return True
+    val_hash = hashlib.sha256(raw_value.strip().encode('utf-8')).hexdigest()
+    return any(hmac.compare_digest(val_hash, target_hash) for target_hash in prohibited_hashes)
+
+
+# SHA-256 hashes of known leaked or placeholder SECRET_KEY values from repository history.
+# Real values must never be stored in this codebase in plaintext.
+_PROHIBITED_SECRET_KEY_HASHES = {
+    'cd52fb323973e36c5895e097899bb2885aa716f13e591f2e12d77eb1a1159165',  # historical leaked key (b7fed16)
+    'ebff49a876eabfabec6bad6a0c06941ff52a12f8aa6c75a704cee2aa4c83d4e2',  # historical leaked key (b7fed16)
+    'eb379dc263b4690252d0f1f3ef7f6b1b35fce3bea3c1c524b402f6e66763bba1',  # historical leaked key (b28df54)
+    '8aa313ec2414e460fb363375ed5f70a7aaa14af264a8fd06ac28fdf8d62bde18',  # historical leaked key (fc8a70b)
+    'e74394b2277fee8790f18c7bb8c6cf479b62a4457c0a1f6c9c344065b22e8889',  # dev default key
+    'ac94c3bcde948f9a22df685c6f1324a8260f2dc991f0e5bee078cae890b282aa',  # .env.example placeholder
+    '6d8deb35eb47ae68b603db2cbd246af6090e5b1dc64b63038553ed94eb55a6b3',  # .env.production.example placeholder
+    '9f929ee0b80bb605058059a6f3182dab67cbef5c8002fb670c69aa36a8cd6186',  # placeholder key
+    'a4c5eea03c1da8a16a7bd8af0c9a1f867eb9e040d65ecaed21aea9c89ab25661',  # CI test key (blocked outside CI)
+}
+
+IS_CI = config('CI', default=False, cast=parse_bool) or config('GITHUB_ACTIONS', default=False, cast=parse_bool)
+
+_CI_TEST_HASHES = {
+    'a4c5eea03c1da8a16a7bd8af0c9a1f867eb9e040d65ecaed21aea9c89ab25661',  # CI SECRET_KEY
+    '3640bb0393ef253c91ad7bad190fe0104af88b1638fb2c3dd0f321b773d561ef',  # CI API_KEY_SECRET
+    '67964f0a632e52a909fe59facc9b501654cb41b18256ed50d2b76bc7f21edf8e',  # CI FIELD_ENCRYPTION_KEY
+}
+
 # Security Settings: Defaults to False in production
 DEBUG = config('DEBUG', default=False, cast=parse_bool)
 
@@ -34,16 +66,26 @@ DEBUG = config('DEBUG', default=False, cast=parse_bool)
 # In production (DEBUG=False), require an explicit, strong SECRET_KEY.
 _DEFAULT_DEV_SECRET = 'django-insecure-dev-fallback-key-for-local-testing-only-991823719238'
 SECRET_KEY = config('SECRET_KEY', default=_DEFAULT_DEV_SECRET if DEBUG else '')
+effective_secret_key_prohibited = (
+    _PROHIBITED_SECRET_KEY_HASHES
+    if not IS_CI
+    else (_PROHIBITED_SECRET_KEY_HASHES - _CI_TEST_HASHES)
+)
 if not DEBUG:
     if not SECRET_KEY:
         raise ImproperlyConfigured(
             "SECRET_KEY environment variable must be set securely when running with DEBUG=False. "
             "Generate one with: python -c \"from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())\""
         )
-    if SECRET_KEY == _DEFAULT_DEV_SECRET or SECRET_KEY.startswith('django-insecure-') or len(SECRET_KEY) < 32:
+    if (
+        SECRET_KEY == _DEFAULT_DEV_SECRET
+        or SECRET_KEY.startswith('django-insecure-')
+        or len(SECRET_KEY) < 32
+        or _is_prohibited_hash(SECRET_KEY, effective_secret_key_prohibited)
+    ):
         raise ImproperlyConfigured(
             "A strong, unique SECRET_KEY of at least 32 characters must be configured in production (DEBUG=False). "
-            "Insecure default or fallback keys are strictly prohibited. "
+            "Insecure default, placeholder, or previously compromised keys are strictly prohibited. "
             "Generate one with: python -c \"from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())\""
         )
 
@@ -240,19 +282,33 @@ SPECTACULAR_SETTINGS = {
 # In development/test mode, fall back to a clearly designated dev key if unset.
 # In production (DEBUG=False), require an explicit unique API_KEY_SECRET.
 _DEFAULT_DEV_API_KEY = 'dev-local-api-key-secret-do-not-use-in-production'
-_PROHIBITED_PROD_API_KEYS = {
-    _DEFAULT_DEV_API_KEY,
-    'dev-testing-service-api-key-381923',
-    'test-api-key',
-    'test-secret-key',
-    'replace-with-a-secure-random-api-key-in-production',
-    'cbHiMJjDLSWmMxIzGZ8YWWb-qRF7cTsT61am2emYM28',
+
+# SHA-256 hashes of known leaked or placeholder API_KEY_SECRET values from repository history.
+# Real values must never be stored in this codebase in plaintext.
+_PROHIBITED_API_KEY_HASHES = {
+    '51e350dcd3f6c6380813ed9a9b16f749de49da318cf8a2778fc760e0c5228e42',  # historical leaked key (b28df54 / settings.py)
+    '8e9e3fd49b5764f99ce4e55810419f319bdb251ce40e1a37baa9f1d46f33722a',  # historical leaked key (b7fed16)
+    '1d8adf17d77e0029a701fe752ee90df9c3cd41d13ac19f70202be51253f6b66c',  # historical leaked key (fc8a70b)
+    'e24b59f1597085251e5fbd3f55bcc9c7b36ae4fd5b0ea6415ec1f1c93694073c',  # dev default key
+    '5dd1c621da575a39427cf13fd0239d1f36c199ffd75a071dff7bd55d8c78b11d',  # dev placeholder
+    '4c806362b613f7496abf284146efd31da90e4b16169fe001841ca17290f427c4',  # test placeholder
+    '2ceac6f36363c6246a64cca805cd43ca7a01b14eb2fcc532ceec3f60f2f7df1c',  # test placeholder
+    '84a3441a2ab0ae44267ee4a2d80df899b645f71fec8b5d50547946fa820946cc',  # test fixture
+    '6fd9cff3ca9c69569c6026ee6f32703cefb6856487f702b210e729acc0b3a802',  # .env.production.example placeholder
+    '12cb13916a614e76312ce963e93fd59091f58d2dde445d334e5b6634f09a4fb8',  # .env.example placeholder
+    '3640bb0393ef253c91ad7bad190fe0104af88b1638fb2c3dd0f321b773d561ef',  # CI test key (blocked outside CI)
 }
+
 API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG else '')
-if not DEBUG and (not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_KEYS):
+effective_api_key_prohibited = (
+    _PROHIBITED_API_KEY_HASHES
+    if not IS_CI
+    else (_PROHIBITED_API_KEY_HASHES - _CI_TEST_HASHES)
+)
+if not DEBUG and (not API_KEY_SECRET or _is_prohibited_hash(API_KEY_SECRET, effective_api_key_prohibited)):
     raise ImproperlyConfigured(
         "A unique, production-grade API_KEY_SECRET must be configured when running with DEBUG=False. "
-        "Shared development credentials and placeholder keys are strictly prohibited in production. "
+        "Shared development credentials, placeholder keys, and previously compromised keys are strictly prohibited in production. "
         "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
     )
 
@@ -260,10 +316,22 @@ if not DEBUG and (not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_K
 API_REQUIRE_REQUEST_SIGNING = config('API_REQUIRE_REQUEST_SIGNING', default=False, cast=bool)
 API_SIGNING_TOLERANCE_SECONDS = config('API_SIGNING_TOLERANCE_SECONDS', default=300, cast=int)
 
+# SHA-256 hashes of known leaked or placeholder FIELD_ENCRYPTION_KEY values from repository history.
+_PROHIBITED_FIELD_ENCRYPTION_KEY_HASHES = {
+    '256684f18ff3f29c4cfc74a4efa2761477ce29ae0dfd74d940b24c7ba0bb51d0',  # .env.production.example placeholder
+    'e349acf30462e809d38bea698bad2ea8a222f6adc41273ba4f6475fb12b8cc97',  # .env.example placeholder
+    '67964f0a632e52a909fe59facc9b501654cb41b18256ed50d2b76bc7f21edf8e',  # CI test key (blocked outside CI)
+}
+
 # Field-Level Symmetric Encryption Key for sensitive tokens at rest (Fernet key)
 # If unset in development/test mode, deterministically derived from SECRET_KEY.
 # In production (DEBUG=False), require an explicit valid 32-byte Fernet key.
 FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY', default=None)
+effective_field_encryption_prohibited = (
+    _PROHIBITED_FIELD_ENCRYPTION_KEY_HASHES
+    if not IS_CI
+    else (_PROHIBITED_FIELD_ENCRYPTION_KEY_HASHES - _CI_TEST_HASHES)
+)
 if not FIELD_ENCRYPTION_KEY and not DEBUG:
     raise ImproperlyConfigured(
         "FIELD_ENCRYPTION_KEY environment variable must be set securely when running with DEBUG=False. "
@@ -277,8 +345,19 @@ if FIELD_ENCRYPTION_KEY:
             if isinstance(FIELD_ENCRYPTION_KEY, str)
             else [FIELD_ENCRYPTION_KEY]
         )
+        if not raw_keys:
+            raise ValueError("No encryption keys found in FIELD_ENCRYPTION_KEY.")
         for rk in raw_keys:
+            rk_str = rk if isinstance(rk, str) else rk.decode('utf-8', errors='ignore')
+            if not DEBUG and _is_prohibited_hash(rk_str, effective_field_encryption_prohibited):
+                raise ImproperlyConfigured(
+                    "A unique, production-grade FIELD_ENCRYPTION_KEY must be configured when running with DEBUG=False. "
+                    "Placeholder, CI, and previously compromised encryption keys are strictly prohibited in production. "
+                    "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+                )
             Fernet(rk.encode('utf-8') if isinstance(rk, str) else rk)
+    except ImproperlyConfigured:
+        raise
     except Exception as exc:
         raise ImproperlyConfigured(
             "Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte url-safe base64-encoded Fernet key "

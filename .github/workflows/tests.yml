@@ -36,6 +36,7 @@ jobs:
       DEBUG: "False"
       ALLOWED_HOSTS: "localhost,127.0.0.1,testserver"
       API_KEY_SECRET: "ci-test-service-api-key-for-github-actions-evaluation"
+      # Public CI test value: must never be used outside CI
       FIELD_ENCRYPTION_KEY: "gfe5N-_1X2ET4v2grNQcDh_skd4a_n6sgik0Q_FdkrM="
       DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/greentree_test"
       EXTERNAL_API_BASE_URL: "https://api.thirdparty-crm.com/v1"
