@@ -106,8 +106,8 @@ class ExtractionJob(models.Model):
         help_text="Timestamp when extraction finished (completed, failed, or cancelled)."
     )
     error_message = models.TextField(
-        null=True,
         blank=True,
+        default="",
         help_text="Descriptive error message if job execution failed or was interrupted."
     )
     error_details = models.JSONField(
@@ -300,7 +300,7 @@ class ExtractedRecord(models.Model):
     email = models.EmailField(
         max_length=255,
         blank=True,
-        null=True,
+        default="",
         db_index=True,
         help_text="Email address of the extracted contact/entity."
     )

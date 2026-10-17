@@ -19,7 +19,7 @@ class ExtractionJobFactory(factory.django.DjangoModelFactory):
     record_count = 0
     start_time = None
     end_time = None
-    error_message = None
+    error_message = ""
     error_details = factory.LazyFunction(dict)
     metadata = factory.LazyFunction(dict)
 
