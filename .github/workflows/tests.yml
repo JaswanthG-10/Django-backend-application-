@@ -56,9 +56,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Validate System Configuration & Linting
+      - name: Code Quality & Linting (Ruff)
+        run: |
+          ruff check .
+
+      - name: Validate System Configuration
         run: |
           python manage.py check
+
+      - name: Check for Unapplied Model Migrations
+        run: |
+          python manage.py makemigrations --check --dry-run
 
       - name: Validate OpenAPI Schema Generation
         run: |
