@@ -36,11 +36,15 @@ _DEFAULT_DEV_SECRET = 'django-insecure-dev-fallback-key-for-local-testing-only-9
 SECRET_KEY = config('SECRET_KEY', default=_DEFAULT_DEV_SECRET if DEBUG else '')
 if not DEBUG:
     if not SECRET_KEY:
-        raise ImproperlyConfigured("SECRET_KEY environment variable must be set securely when running with DEBUG=False.")
+        raise ImproperlyConfigured(
+            "SECRET_KEY environment variable must be set securely when running with DEBUG=False. "
+            "Generate one with: python -c \"from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())\""
+        )
     if SECRET_KEY == _DEFAULT_DEV_SECRET or SECRET_KEY.startswith('django-insecure-') or len(SECRET_KEY) < 32:
         raise ImproperlyConfigured(
             "A strong, unique SECRET_KEY of at least 32 characters must be configured in production (DEBUG=False). "
-            "Insecure default or fallback keys are strictly prohibited."
+            "Insecure default or fallback keys are strictly prohibited. "
+            "Generate one with: python -c \"from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())\""
         )
 
 ALLOWED_HOSTS = config(
@@ -115,7 +119,10 @@ DATABASE_URL = config('DATABASE_URL', default=_DEFAULT_SQLITE_URL if DEBUG else 
 if not DATABASE_URL and not DEBUG:
     raise ImproperlyConfigured("DATABASE_URL environment variable must be set securely when running with DEBUG=False.")
 if not DEBUG and DATABASE_URL.startswith('sqlite'):
-    raise ImproperlyConfigured("SQLite is not permitted in production (DEBUG=False). Please configure a PostgreSQL DATABASE_URL.")
+    raise ImproperlyConfigured(
+        "SQLite is not permitted in production (DEBUG=False). Please configure a PostgreSQL DATABASE_URL. "
+        "Example: DATABASE_URL=postgresql://username:password@hostname:5432/dbname?sslmode=require"
+    )
 
 _is_postgres = not DATABASE_URL.startswith('sqlite')
 _is_local_db = any(h in DATABASE_URL for h in ('localhost', '127.0.0.1', 'testserver'))
@@ -245,7 +252,8 @@ API_KEY_SECRET = config('API_KEY_SECRET', default=_DEFAULT_DEV_API_KEY if DEBUG 
 if not DEBUG and (not API_KEY_SECRET or API_KEY_SECRET in _PROHIBITED_PROD_API_KEYS):
     raise ImproperlyConfigured(
         "A unique, production-grade API_KEY_SECRET must be configured when running with DEBUG=False. "
-        "Shared development credentials and placeholder keys are strictly prohibited in production."
+        "Shared development credentials and placeholder keys are strictly prohibited in production. "
+        "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
     )
 
 # Request Signing Security (HMAC-SHA256 Payload & Timestamp Verification)
@@ -257,13 +265,19 @@ API_SIGNING_TOLERANCE_SECONDS = config('API_SIGNING_TOLERANCE_SECONDS', default=
 # In production (DEBUG=False), require an explicit valid 32-byte Fernet key.
 FIELD_ENCRYPTION_KEY = config('FIELD_ENCRYPTION_KEY', default=None)
 if not FIELD_ENCRYPTION_KEY and not DEBUG:
-    raise ImproperlyConfigured("FIELD_ENCRYPTION_KEY environment variable must be set securely when running with DEBUG=False.")
+    raise ImproperlyConfigured(
+        "FIELD_ENCRYPTION_KEY environment variable must be set securely when running with DEBUG=False. "
+        "Generate a 32-byte Fernet key with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+    )
 if FIELD_ENCRYPTION_KEY:
     try:
         from cryptography.fernet import Fernet
         Fernet(FIELD_ENCRYPTION_KEY.encode('utf-8') if isinstance(FIELD_ENCRYPTION_KEY, str) else FIELD_ENCRYPTION_KEY)
     except Exception as exc:
-        raise ImproperlyConfigured("Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte Fernet key.") from exc
+        raise ImproperlyConfigured(
+            "Invalid FIELD_ENCRYPTION_KEY. Must be a valid 32-byte url-safe base64-encoded Fernet key. "
+            "Generate one with: python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\""
+        ) from exc
 
 # Asynchronous background execution (worker / thread runner)
 EXTRACTION_ASYNC_EXECUTION = config('EXTRACTION_ASYNC_EXECUTION', default=True, cast=bool)
@@ -285,8 +299,15 @@ EXTERNAL_API_PAGINATION_TYPE = config('EXTERNAL_API_PAGINATION_TYPE', default='a
 EXTERNAL_API_ENDPOINT_TEMPLATE = config('EXTERNAL_API_ENDPOINT_TEMPLATE', default='{base_url}/crm/v3/objects/{source_type}')
 EXTERNAL_API_RECORDS_KEY = config('EXTERNAL_API_RECORDS_KEY', default='results')
 EXTERNAL_API_CURSOR_PARAM = config('EXTERNAL_API_CURSOR_PARAM', default='after')
+EXTERNAL_API_PAGE_SIZE = config('EXTERNAL_API_PAGE_SIZE', default=100, cast=int)
+# Trade-off: Raising MAX_PAGES to 2000 allows fetching up to 200,000 records with standard page size (100).
+# Trade-off note: Higher values risk prolonged execution time and memory consumption during large syncs,
+# while lower values protect against runaway loops and upstream billing exhaustion.
+EXTERNAL_API_MAX_PAGES = config('EXTERNAL_API_MAX_PAGES', default=2000, cast=int)
+EXTERNAL_API_ON_PAGE_LIMIT = config('EXTERNAL_API_ON_PAGE_LIMIT', default='fail')  # 'fail' or 'truncate'
+EXTERNAL_API_MAX_RATE_LIMIT_RETRIES = config('EXTERNAL_API_MAX_RATE_LIMIT_RETRIES', default=5, cast=int)
 EXTERNAL_API_MAX_RETRY_AFTER_SECONDS = config('EXTERNAL_API_MAX_RETRY_AFTER_SECONDS', default=60.0, cast=float)
-EXTERNAL_API_MAX_PAGES = config('EXTERNAL_API_MAX_PAGES', default=500, cast=int)
+EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS = config('EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS', default=300.0, cast=float)
 
 # Validate external API base URL configuration
 if EXTERNAL_API_BASE_URL:

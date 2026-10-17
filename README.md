@@ -265,9 +265,12 @@ All settings are configured using decoupled environment variables. See [.env.exa
 | `EXTERNAL_API_BASE_URL` | `https://api.hubapi.com` | Base URL of documented third-party provider (HubSpot CRM Objects API). |
 | `EXTERNAL_API_ENDPOINT_TEMPLATE` | `{base_url}/crm/v3/objects/{source_type}` | URL endpoint template supporting `{base_url}` and `{source_type}` placeholders. |
 | `EXTERNAL_API_RECORDS_KEY` | `results` | Response dictionary key holding records list (`results` for HubSpot). |
-| `EXTERNAL_API_CURSOR_PARAM` | `after` | Query parameter name for cursor pagination (`after` for HubSpot). |
-| `EXTERNAL_API_TIMEOUT` | `10` | Timeout in seconds for external API requests. |
-| `EXTERNAL_API_MAX_RETRY_AFTER_SECONDS` | `60.0` | Maximum delay ceiling in seconds to honor for HTTP 429 `Retry-After` headers. |
+| `EXTERNAL_API_PAGE_SIZE` | `100` | Default record batch size per pagination request. |
+| `EXTERNAL_API_MAX_PAGES` | `2000` | Maximum page safety limit per extraction job (up to 200,000 records). *Trade-off*: Higher limits support large imports but increase job duration and memory consumption; lower limits safeguard upstream rate limits and prevent runaway loops. |
+| `EXTERNAL_API_ON_PAGE_LIMIT` | `fail` | Policy when `EXTERNAL_API_MAX_PAGES` is reached (`fail` to terminate job as `FAILED` with `PAGE_LIMIT_EXCEEDED`, or `truncate` to complete job with `metadata.truncated = True`). |
+| `EXTERNAL_API_MAX_RATE_LIMIT_RETRIES` | `5` | Dedicated retry budget for HTTP 429 rate limit responses (independent of 5xx server retries). |
+| `EXTERNAL_API_MAX_RETRY_AFTER_SECONDS` | `60.0` | Maximum single-attempt delay ceiling in seconds to honor for HTTP 429 `Retry-After` headers. |
+| `EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS` | `300.0` | Total cumulative wait ceiling in seconds for HTTP 429 retries per request before failing safely. |
 | `EXTRACTION_HEARTBEAT_INTERVAL_SECONDS` | `30` | Interval in seconds between worker heartbeat updates during active processing. |
 | `EXTRACTION_STALE_THRESHOLD_MINUTES` | `15` | Minutes without a heartbeat before an in-progress job is deemed abandoned and recovered. |
 | `EXTRACTION_ASYNC_EXECUTION` | `True` | Automatically dispatches background worker pool on scan start. |
