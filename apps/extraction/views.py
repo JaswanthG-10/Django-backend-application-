@@ -1,42 +1,41 @@
 """API Views implementing Data Extraction Service endpoints."""
-import uuid
 import logging
-from django.db import connection, transaction
-from django.utils import timezone
-from rest_framework import status
-from rest_framework.views import APIView
-from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiResponse
+import uuid
 
 from django.conf import settings
-from apps.extraction.models import JobStatus
+from django.db import connection, transaction
+from django.utils import timezone
+from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
+from rest_framework import status
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from apps.common.exceptions import (
+    JobIncompleteError,
+    ResourceNotFoundError,
+)
+from apps.common.pagination import StandardLimitOffsetPagination
 from apps.common.permissions import HasServiceApiKey
-from apps.common.authentication import ApiKeyAuthentication
+from apps.extraction.models import JobStatus
+from apps.extraction.selectors import (
+    calculate_job_analytics,
+    calculate_job_statistics,
+    get_job_by_id,
+    get_job_records,
+    list_jobs,
+)
 from apps.extraction.serializers import (
-    StartScanRequestSerializer,
-    StartScanResponseSerializer,
-    JobStatusResponseSerializer,
     ExtractedRecordSerializer,
+    HealthResponseSerializer,
+    JobAnalyticsSerializer,
     JobCancelResponseSerializer,
     JobListSerializer,
     JobStatisticsSerializer,
-    JobAnalyticsSerializer,
-    HealthResponseSerializer,
+    JobStatusResponseSerializer,
+    StartScanRequestSerializer,
+    StartScanResponseSerializer,
 )
 from apps.extraction.services import ExtractionService
-from apps.extraction.selectors import (
-    get_job_by_id,
-    list_jobs,
-    get_job_records,
-    calculate_job_statistics,
-    calculate_job_analytics,
-)
-from apps.common.exceptions import (
-    ResourceNotFoundError,
-    JobIncompleteError,
-    BaseDomainException,
-)
-from apps.common.pagination import StandardLimitOffsetPagination
 
 logger = logging.getLogger('apps.extraction.views')
 
@@ -49,7 +48,7 @@ def parse_uuid_or_404(raw_id: str) -> uuid.UUID:
         raise ResourceNotFoundError(
             message=f"Invalid or non-existent job ID: '{raw_id}'",
             details={'provided_id': str(raw_id)}
-        )
+        ) from None
 
 
 class StartScanView(APIView):
@@ -357,7 +356,7 @@ class HealthCheckView(APIView):
             with connection.cursor() as cursor:
                 cursor.execute("SELECT 1")
                 cursor.fetchone()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Health check database failure: %s", exc)
             db_status = "unhealthy"
             status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -420,7 +419,7 @@ class ReadinessHealthCheckView(APIView):
                 'database': 'healthy',
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_200_OK)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.error("Readiness probe database check failed: %s", exc)
             return Response({
                 'status': 'degraded',

@@ -1,17 +1,18 @@
 """URL routing for extraction domain matching GreenTree API test specifications."""
 from django.urls import path
+
 from apps.extraction.views import (
-    StartScanView,
-    ScanStatusView,
-    ScanResultView,
-    ScanCancelView,
-    ScanRemoveView,
+    HealthCheckView,
+    JobAnalyticsView,
     JobListJobsView,
     JobStatisticsView,
-    JobAnalyticsView,
-    HealthCheckView,
     LivenessHealthCheckView,
     ReadinessHealthCheckView,
+    ScanCancelView,
+    ScanRemoveView,
+    ScanResultView,
+    ScanStatusView,
+    StartScanView,
 )
 
 app_name = 'extraction'

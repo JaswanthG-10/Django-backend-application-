@@ -1,6 +1,7 @@
 """Performance and N+1 query prevention tests."""
 import pytest
 from django.urls import reverse
+
 from apps.extraction.tests.factories import (
     CompletedExtractionJobFactory,
     ExtractedRecordFactory,

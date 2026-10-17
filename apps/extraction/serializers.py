@@ -1,6 +1,7 @@
 """DRF Serializers for Data Extraction API inputs and outputs."""
 from rest_framework import serializers
-from apps.extraction.models import ExtractionJob, ExtractedRecord, SourceType, JobStatus
+
+from apps.extraction.models import ExtractedRecord, ExtractionJob, SourceType
 
 
 class StartScanRequestSerializer(serializers.Serializer):

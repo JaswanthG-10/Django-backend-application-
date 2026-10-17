@@ -1,15 +1,17 @@
 """Unit tests for ThirdPartyExtractionClient external communication."""
 from unittest.mock import MagicMock, patch
+
 import pytest
 import requests
-from apps.extraction.clients import ThirdPartyExtractionClient
+
 from apps.common.exceptions import (
+    ExternalServiceAuthError,
     ExternalServiceError,
     ExternalServiceTimeoutError,
-    ExternalServiceAuthError,
-    ResourceNotFoundError,
     RateLimitExceededError,
+    ResourceNotFoundError,
 )
+from apps.extraction.clients import ThirdPartyExtractionClient
 
 
 class TestThirdPartyExtractionClient:

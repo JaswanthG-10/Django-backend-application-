@@ -1,8 +1,10 @@
 """FactoryBoy factories for deterministic test data generation."""
 import uuid
+
 import factory
 from django.utils import timezone
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
+
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus, SourceType
 
 
 class ExtractionJobFactory(factory.django.DjangoModelFactory):

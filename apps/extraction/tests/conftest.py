@@ -1,17 +1,16 @@
 """Pytest fixtures and seeded test scenarios."""
 import pytest
-from rest_framework.test import APIClient
-from apps.extraction.tests.factories import (
-    ExtractionJobFactory,
-    CompletedExtractionJobFactory,
-    InProgressExtractionJobFactory,
-    FailedExtractionJobFactory,
-    CancelledExtractionJobFactory,
-    ExtractedRecordFactory,
-)
-
-
 from django.conf import settings
+from rest_framework.test import APIClient
+
+from apps.extraction.tests.factories import (
+    CancelledExtractionJobFactory,
+    CompletedExtractionJobFactory,
+    ExtractedRecordFactory,
+    ExtractionJobFactory,
+    FailedExtractionJobFactory,
+    InProgressExtractionJobFactory,
+)
 
 
 @pytest.fixture(autouse=True)

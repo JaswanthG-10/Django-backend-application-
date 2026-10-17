@@ -1,8 +1,10 @@
 """Standalone extraction worker command for processing queued jobs."""
-import time
 import logging
+import time
+
 from django.core.management.base import BaseCommand
 from django.db import connection
+
 from apps.extraction.models import JobStatus
 from apps.extraction.services import ExtractionService
 
@@ -80,7 +82,7 @@ class Command(BaseCommand):
                         ))
                     elif job.status == JobStatus.CANCELLED:
                         self.stdout.write(self.style.WARNING(f"Job {job.id} was cancelled during execution."))
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - worker loop catches all job exceptions to maintain polling loop
                     self.stdout.write(self.style.ERROR(f"Failed job {job.id}: {exc}"))
             else:
                 if run_once:

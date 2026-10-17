@@ -1,9 +1,10 @@
 """Database models for the Data Extraction Service."""
-import uuid
 import hashlib
-from typing import Optional
+import uuid
+
 from django.db import models
 from django.utils import timezone
+
 from apps.common.exceptions import InvalidStateTransitionError
 
 
@@ -150,7 +151,7 @@ class ExtractionJob(models.Model):
         return hashlib.sha256(raw_token.strip().encode('utf-8')).hexdigest()
 
     @staticmethod
-    def compute_dedup_hash(raw_token: str, source_type: str = 'crm', filters: Optional[dict] = None) -> str:
+    def compute_dedup_hash(raw_token: str, source_type: str = 'crm', filters: dict | None = None) -> str:
         """Produces a deterministic SHA-256 hash of token, source_type, and sorted filters."""
         import json
         normalized_filters = json.dumps(filters or {}, sort_keys=True, separators=(',', ':'))
@@ -180,14 +181,16 @@ class ExtractionJob(models.Model):
         else:
             self.encrypted_token = ''
 
-    def get_decrypted_token(self) -> Optional[str]:
+    def get_decrypted_token(self) -> str | None:
         """Decrypts and returns the stored external provider token, or None if empty or invalid."""
+        from cryptography.fernet import InvalidToken
+
         from apps.common.encryption import decrypt_secret
         if not self.encrypted_token:
             return None
         try:
             return decrypt_secret(self.encrypted_token)
-        except Exception:
+        except (InvalidToken, ValueError, TypeError):
             return None
 
     def clear_encrypted_token(self) -> None:
@@ -200,7 +203,7 @@ class ExtractionJob(models.Model):
         return self.status in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
 
     @property
-    def duration_seconds(self) -> Optional[float]:
+    def duration_seconds(self) -> float | None:
         """Calculates total execution duration in seconds if start and end times exist."""
         if self.start_time and self.end_time:
             return (self.end_time - self.start_time).total_seconds()
@@ -225,9 +228,9 @@ class ExtractionJob(models.Model):
     def transition_to(
         self,
         target_status: str,
-        error_message: Optional[str] = None,
-        error_details: Optional[dict] = None,
-        record_count: Optional[int] = None
+        error_message: str | None = None,
+        error_details: dict | None = None,
+        record_count: int | None = None
     ) -> None:
         """Applies a verified state transition or raises InvalidStateTransitionError."""
         if not self.can_transition_to(target_status):

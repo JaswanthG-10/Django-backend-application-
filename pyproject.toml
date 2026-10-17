@@ -1,0 +1,14 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "apps/extraction/migrations",
+]
+
+[tool.ruff.lint]
+ignore = [
+    "RUF012",  # Mutable class attributes in Django models/serializers/views
+]

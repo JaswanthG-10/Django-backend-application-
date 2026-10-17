@@ -5,22 +5,26 @@ import hashlib
 import hmac
 import json
 import time
-import pytest
-from unittest.mock import MagicMock, patch, call
 from io import StringIO
+from unittest.mock import MagicMock, patch
+
+import pytest
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from django.urls import reverse
-from django.utils import timezone
 from django.core.management import call_command
 from django.test import override_settings
+from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
-from apps.extraction.services import ExtractionService
+from apps.common.exceptions import (
+    ExternalServiceError,
+    RateLimitExceededError,
+    ResourceNotFoundError,
+)
 from apps.extraction.clients import ThirdPartyExtractionClient, parse_retry_after
-from apps.common.encryption import encrypt_secret, decrypt_secret
-from apps.common.exceptions import RateLimitExceededError, ExternalServiceError, ExternalServiceTimeoutError
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus, SourceType
+from apps.extraction.services import ExtractionService
 from config.settings import parse_bool
 
 
@@ -781,9 +785,10 @@ class TestSecureDjangoDebugDefaults:
         with pytest.raises(ValueError):
             parse_bool("not-a-boolean")
 
-    def test_missing_debug_defaults_to_false(self):
+    def test_missing_debug_defaults_to_false(self, monkeypatch):
         """Security: Missing DEBUG setting defaults safely to False."""
-        from decouple import RepositoryEmpty, Config
+        monkeypatch.delenv("DEBUG", raising=False)
+        from decouple import Config, RepositoryEmpty
         empty_config = Config(RepositoryEmpty())
         val = empty_config('DEBUG', default=False, cast=parse_bool)
         assert val is False
@@ -808,7 +813,7 @@ class TestHttp429RetryAfterHandling:
 
     def test_parse_retry_after_http_date(self):
         """Retry-After: Valid RFC 7231 HTTP-date parsed into seconds delay."""
-        future_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=60)
+        future_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=60)
         date_str = email.utils.format_datetime(future_dt)
 
         delay = parse_retry_after(date_str)
@@ -842,7 +847,7 @@ class TestHttp429RetryAfterHandling:
     @patch('requests.Session.get')
     def test_http_date_retry_after_honored(self, mock_get, mock_sleep):
         """Retry-After: HTTP-date format honored accurately."""
-        future_dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=25)
+        future_dt = datetime.datetime.now(datetime.UTC) + datetime.timedelta(seconds=25)
         date_str = email.utils.format_datetime(future_dt)
 
         resp_429 = MagicMock()
@@ -932,7 +937,7 @@ class TestHttp429RetryAfterHandling:
         mock_get.return_value = resp_404
 
         client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
-        with pytest.raises(Exception):
+        with pytest.raises(ResourceNotFoundError):
             client.extract_data(api_token="test-token", source_type="contacts")
 
         # 404 must not sleep or retry

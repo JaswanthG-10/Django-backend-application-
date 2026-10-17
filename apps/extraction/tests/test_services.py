@@ -1,15 +1,17 @@
 """Tests for ExtractionService orchestration and business rules."""
 import uuid
 from unittest.mock import MagicMock
+
 import pytest
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus
-from apps.extraction.services import ExtractionService
+
 from apps.common.exceptions import (
-    ResourceNotFoundError,
-    InvalidStateTransitionError,
     DuplicateJobConflictError,
     ExternalServiceError,
+    InvalidStateTransitionError,
+    ResourceNotFoundError,
 )
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus
+from apps.extraction.services import ExtractionService
 
 
 @pytest.mark.django_db
@@ -106,7 +108,7 @@ class TestExtractionService:
             service.cancel_job(uuid.uuid4())
 
     def test_remove_job_data(self, seeded_completed_job_with_records):
-        job, records = seeded_completed_job_with_records
+        job, _records = seeded_completed_job_with_records
         service = ExtractionService()
         service.remove_job_data(job.id)
 
@@ -169,9 +171,10 @@ class TestExtractionService:
         assert "/app/internal.py" not in str(job.error_details)
 
     def test_run_extraction_worker_command_once(self, seeded_pending_job, sample_external_api_payload):
-        from django.core.management import call_command
         from io import StringIO
         from unittest.mock import patch
+
+        from django.core.management import call_command
 
         out = StringIO()
         with patch('apps.extraction.clients.ThirdPartyExtractionClient.extract_data', return_value=sample_external_api_payload):
@@ -184,8 +187,12 @@ class TestExtractionService:
 
     def test_bounded_thread_pool_executor_lifecycle(self, settings):
         """Worker Pool: Verifies bounded ThreadPoolExecutor lifecycle and shutdown."""
-        from apps.extraction.services import get_extraction_executor, shutdown_extraction_executor
         import concurrent.futures
+
+        from apps.extraction.services import (
+            get_extraction_executor,
+            shutdown_extraction_executor,
+        )
 
         settings.EXTRACTION_MAX_WORKERS = 3
         shutdown_extraction_executor(wait=True)

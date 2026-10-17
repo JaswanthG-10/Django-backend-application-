@@ -1,27 +1,29 @@
 """Business service layer for managing extraction job workflows."""
+import atexit
 import logging
 import threading
-import atexit
 from concurrent.futures import ThreadPoolExecutor
-from typing import Tuple, Optional, Dict, Any
+from typing import Any
 from uuid import UUID
+
 from django.conf import settings
-from django.db import transaction, connection, models
+from django.db import connection, models, transaction
 from django.utils import timezone
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
-from apps.extraction.selectors import get_job_by_id, get_active_job_by_dedup_hash
-from apps.extraction.clients import ThirdPartyExtractionClient
+
 from apps.common.exceptions import (
-    ResourceNotFoundError,
-    InvalidStateTransitionError,
-    DuplicateJobConflictError,
     BaseDomainException,
+    DuplicateJobConflictError,
+    InvalidStateTransitionError,
+    ResourceNotFoundError,
 )
+from apps.extraction.clients import ThirdPartyExtractionClient
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus, SourceType
+from apps.extraction.selectors import get_active_job_by_dedup_hash, get_job_by_id
 
 logger = logging.getLogger('apps.extraction.services')
 
 # Bounded thread pool executor for managed asynchronous execution in production
-_extraction_executor: Optional[ThreadPoolExecutor] = None
+_extraction_executor: ThreadPoolExecutor | None = None
 _executor_lock = threading.Lock()
 
 
@@ -54,7 +56,7 @@ def shutdown_extraction_executor(wait: bool = False) -> None:
 class ExtractionService:
     """Orchestrates job lifecycle transitions, deduplication, and data extraction pipelines."""
 
-    def __init__(self, client: Optional[ThirdPartyExtractionClient] = None):
+    def __init__(self, client: ThirdPartyExtractionClient | None = None):
         self.client = client or ThirdPartyExtractionClient()
 
     @classmethod
@@ -78,7 +80,7 @@ class ExtractionService:
                 # Retrieve token from parameter or decrypted storage
                 token = api_token or claimed.get_decrypted_token()
                 service.process_extraction(job_id=job_id, api_token=token, already_claimed=True)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "Background extraction task completed with status update for job %s: %s",
                     job_id, exc
@@ -94,10 +96,10 @@ class ExtractionService:
         self,
         api_token: str,
         source_type: str = SourceType.CRM,
-        metadata: Optional[Dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
         deduplicate: bool = True,
         strict_conflict: bool = False
-    ) -> Tuple[ExtractionJob, bool]:
+    ) -> tuple[ExtractionJob, bool]:
         """Creates a new extraction job or returns/conflicts on an active duplicate.
         
         Deduplication checks token_hash + source_type + normalized filters. If filters differ,
@@ -141,7 +143,7 @@ class ExtractionService:
         return job, True
 
     @classmethod
-    def claim_job(cls, job_id: Optional[UUID] = None) -> Optional[ExtractionJob]:
+    def claim_job(cls, job_id: UUID | None = None) -> ExtractionJob | None:
         """Atomically claims a specific or next pending extraction job without race conditions.
         
         Uses conditional update (status=PENDING -> IN_PROGRESS) to guarantee that across both
@@ -190,7 +192,7 @@ class ExtractionService:
         return None
 
     @classmethod
-    def claim_next_pending_job(cls) -> Optional[ExtractionJob]:
+    def claim_next_pending_job(cls) -> ExtractionJob | None:
         """Convenience method for worker loops."""
         return cls.claim_job()
 
@@ -205,7 +207,7 @@ class ExtractionService:
         return rows > 0
 
     @classmethod
-    def recover_stale_jobs(cls, timeout_minutes: Optional[int] = None, allow_retry: bool = True) -> int:
+    def recover_stale_jobs(cls, timeout_minutes: int | None = None, allow_retry: bool = True) -> int:
         """Identifies and recovers stale/abandoned in_progress jobs automatically using heartbeats.
         
         Heartbeat-based recovery criteria:
@@ -303,7 +305,7 @@ class ExtractionService:
                     if rows == 1:
                         logger.info("Stale job %s permanently transitioned to FAILED (%s)", job.id, reason)
                         recovered_count += 1
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.error("Failed to recover stale job %s: %s", job.id, exc)
 
         return recovered_count
@@ -357,8 +359,8 @@ class ExtractionService:
     def process_extraction(
         self,
         job_id: UUID,
-        api_token: Optional[str] = None,
-        mock_records: Optional[list] = None,
+        api_token: str | None = None,
+        mock_records: list | None = None,
         already_claimed: bool = False
     ) -> ExtractionJob:
         """Executes the extraction pipeline for a job.
@@ -484,8 +486,8 @@ class ExtractionService:
                 )
             raise
 
-        except Exception as exc:
-            logger.exception("Unexpected error during extraction for job %s: %s", job.id, str(exc))
+        except Exception:
+            logger.exception("Unexpected error during extraction for job %s", job.id)
             # Never leak raw str(exc), tracebacks, or internal database errors to client status
             job.refresh_from_db()
             if job.status != JobStatus.CANCELLED:

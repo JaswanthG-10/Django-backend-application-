@@ -2,8 +2,9 @@
 import pytest
 from django.db import IntegrityError
 from django.utils import timezone
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus, SourceType
+
 from apps.common.exceptions import InvalidStateTransitionError
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus
 
 
 @pytest.mark.django_db

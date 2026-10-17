@@ -1,9 +1,10 @@
 """Permission classes for securing API endpoints."""
 import hmac
 import logging
+
 from django.conf import settings
-from rest_framework.permissions import BasePermission
 from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated
+from rest_framework.permissions import BasePermission
 
 logger = logging.getLogger('apps.common.permissions')
 

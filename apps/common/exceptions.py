@@ -1,9 +1,10 @@
 """Standardized exception handling and domain exceptions."""
 import logging
-from rest_framework.views import exception_handler
-from rest_framework.response import Response
+
 from rest_framework import status
 from rest_framework.exceptions import APIException
+from rest_framework.response import Response
+from rest_framework.views import exception_handler
 
 logger = logging.getLogger('apps.common.exceptions')
 
@@ -128,10 +129,8 @@ def custom_exception_handler(exc, context):
             code = 'CONFLICT'
             message = 'The request conflicts with the current resource state.'
 
-        if isinstance(details, dict):
-            # If 'detail' is present in standard DRF errors
-            if 'detail' in details:
-                message = str(details.pop('detail'))
+        if isinstance(details, dict) and 'detail' in details:
+            message = str(details.pop('detail'))
 
         payload = {
             'error': {

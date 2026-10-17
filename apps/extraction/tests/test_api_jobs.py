@@ -1,7 +1,8 @@
 """Tests for job listing, filtering, and aggregated statistics endpoints."""
 import pytest
-from rest_framework import status
 from django.urls import reverse
+from rest_framework import status
+
 from apps.extraction.models import JobStatus
 
 

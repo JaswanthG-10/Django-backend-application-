@@ -1,8 +1,9 @@
 """Comprehensive tests covering all edge cases specified in Section 7 of GreenTree guidelines."""
 import uuid
+
 import pytest
-from rest_framework import status
 from django.urls import reverse
+from rest_framework import status
 
 
 @pytest.mark.django_db
@@ -133,7 +134,7 @@ class TestEdgeCases:
 
     def test_pagination_stress_and_bounds(self, api_client, seeded_completed_job_with_records):
         """Edge case: Pagination with extreme or invalid values."""
-        job, records = seeded_completed_job_with_records
+        job, _records = seeded_completed_job_with_records
         url = reverse('extraction:scan-result', kwargs={'job_id': job.id})
 
         # Bounded to max limit (100)

@@ -1,26 +1,29 @@
 """Client for communicating with external third-party data providers."""
+import datetime
+import email.utils
+import logging
+import random
 import re
 import time
-import random
-import email.utils
-import datetime
-import logging
 import urllib.parse
-from typing import List, Dict, Any, Optional, Callable
+from collections.abc import Callable
+from typing import Any
+
 import requests
 from django.conf import settings
+
 from apps.common.exceptions import (
+    ExternalServiceAuthError,
     ExternalServiceError,
     ExternalServiceTimeoutError,
-    ExternalServiceAuthError,
-    ResourceNotFoundError,
     RateLimitExceededError,
+    ResourceNotFoundError,
 )
 
 logger = logging.getLogger('apps.extraction.clients')
 
 
-def parse_retry_after(header_val: Optional[str]) -> Optional[float]:
+def parse_retry_after(header_val: str | None) -> float | None:
     """Parses Retry-After header into delay in seconds.
     
     Supports both standard RFC 7231 / RFC 2616 formats:
@@ -45,12 +48,12 @@ def parse_retry_after(header_val: Optional[str]) -> Optional[float]:
         parsed_dt = email.utils.parsedate_to_datetime(val)
         if parsed_dt:
             if parsed_dt.tzinfo is None:
-                parsed_dt = parsed_dt.replace(tzinfo=datetime.timezone.utc)
-            now = datetime.datetime.now(datetime.timezone.utc)
-            delay = (target_dt := parsed_dt) and (target_dt - now).total_seconds()
+                parsed_dt = parsed_dt.replace(tzinfo=datetime.UTC)
+            now = datetime.datetime.now(datetime.UTC)
+            delay = (parsed_dt - now).total_seconds()
             return max(0.0, delay)
-    except Exception:
-        pass
+    except (ValueError, TypeError) as exc:
+        logger.warning("Failed to parse Retry-After header as HTTP-date: %s", exc)
 
     return None
 
@@ -69,10 +72,10 @@ class ThirdPartyExtractionClient:
 
     def __init__(
         self,
-        base_url: Optional[str] = None,
-        timeout: Optional[int] = None,
+        base_url: str | None = None,
+        timeout: int | None = None,
         max_retries: int = 3,
-        session: Optional[requests.Session] = None
+        session: requests.Session | None = None
     ):
         raw_base_url = (base_url or getattr(settings, 'EXTERNAL_API_BASE_URL', 'https://api.hubapi.com')).rstrip('/')
         if not getattr(settings, 'DEBUG', True) and raw_base_url.lower().startswith('http://'):
@@ -169,9 +172,9 @@ class ThirdPartyExtractionClient:
     def _execute_request_with_retries(
         self,
         url: str,
-        headers: Dict[str, str],
-        params: Dict[str, Any],
-        max_retry_after: Optional[float] = None
+        headers: dict[str, str],
+        params: dict[str, Any],
+        max_retry_after: float | None = None
     ) -> requests.Response:
         """Executes GET request with exponential backoff on 429 and 5xx errors.
         
@@ -269,7 +272,7 @@ class ThirdPartyExtractionClient:
             # Non-retryable responses returned immediately
             return response
 
-    def _normalize_raw_record(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+    def _normalize_raw_record(self, raw: dict[str, Any]) -> dict[str, Any]:
         """Normalizes diverse third-party schemas into standard entity records."""
         rec_id = str(raw.get('id') or raw.get('id_from_service') or raw.get('uuid') or '')
         props = raw.get('properties') if isinstance(raw.get('properties'), dict) else {}
@@ -301,11 +304,11 @@ class ThirdPartyExtractionClient:
         self,
         api_token: str,
         source_type: str = 'crm',
-        filters: Optional[Dict[str, Any]] = None,
-        max_pages: Optional[int] = None,
+        filters: dict[str, Any] | None = None,
+        max_pages: int | None = None,
         page_size: int = 20,
-        heartbeat_callback: Optional[Callable[[], None]] = None,
-    ) -> List[Dict[str, Any]]:
+        heartbeat_callback: Callable[[], None] | None = None,
+    ) -> list[dict[str, Any]]:
         """Fetches and pages through records from external provider endpoint.
         
         Continues fetching pages until the external provider indicates no further records
@@ -337,7 +340,7 @@ class ThirdPartyExtractionClient:
             url, source_type, masked, filters
         )
 
-        all_records: List[Dict[str, Any]] = []
+        all_records: list[dict[str, Any]] = []
         seen_ids = set()
         visited_urls = set()
         visited_cursors = set()
@@ -473,7 +476,7 @@ class ThirdPartyExtractionClient:
             if heartbeat_callback:
                 try:
                     heartbeat_callback()
-                except Exception as exc:
+                except (RuntimeError, ValueError, TypeError, AttributeError) as exc:
                     logger.debug("Heartbeat callback exception ignored: %s", exc)
 
             # Detect cursor or next page link for subsequent requests
@@ -490,10 +493,9 @@ class ThirdPartyExtractionClient:
                         if isinstance(next_obj, dict):
                             next_cursor = next_obj.get('after')
                 # Generic cursor style: {"next_cursor": "..."} or {"cursor": "..."}
-                if not next_cursor:
-                    if 'next_cursor' in payload or 'cursor' in payload:
-                        has_paging_block = True
-                        next_cursor = payload.get('next_cursor') or payload.get('cursor')
+                if not next_cursor and ('next_cursor' in payload or 'cursor' in payload):
+                    has_paging_block = True
+                    next_cursor = payload.get('next_cursor') or payload.get('cursor')
 
                 # Next URL style (RFC 5988 / REST next link)
                 links = getattr(response, 'links', None)

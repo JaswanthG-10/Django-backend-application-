@@ -1,7 +1,8 @@
 """Integration tests for Scan Workflow endpoints matching GreenTree guidelines."""
 import pytest
-from rest_framework import status
 from django.urls import reverse
+from rest_framework import status
+
 from apps.extraction.models import ExtractionJob, JobStatus
 
 
@@ -20,6 +21,7 @@ class TestScanWorkflowApi:
     def test_start_scan_success(self, api_client):
         """Step 2: Start New Extraction (/api/v1/scan/start) with body."""
         from unittest.mock import patch
+
         from apps.extraction.services import ExtractionService
 
         url = reverse('extraction:scan-start')
@@ -28,7 +30,7 @@ class TestScanWorkflowApi:
             'source_type': 'crm',
             'filters': {'created_after': '2026-01-01'}
         }
-        with patch.object(ExtractionService, 'dispatch_background_extraction') as mock_dispatch:
+        with patch.object(ExtractionService, 'dispatch_background_extraction'):
             response = api_client.post(url, data=payload, format='json')
             assert response.status_code == status.HTTP_202_ACCEPTED
             data = response.json()
@@ -44,6 +46,7 @@ class TestScanWorkflowApi:
     def test_start_scan_with_header_token(self, api_client):
         """Step 2 variation: Start scan providing token via X-API-Token header."""
         from unittest.mock import patch
+
         from apps.extraction.services import ExtractionService
 
         url = reverse('extraction:scan-start')
@@ -83,7 +86,7 @@ class TestScanWorkflowApi:
 
     def test_fetch_extraction_results(self, api_client, seeded_completed_job_with_records):
         """Step 3: Fetch Extraction Results (/api/v1/scan/result/<job_id>)."""
-        job, records = seeded_completed_job_with_records
+        job, _records = seeded_completed_job_with_records
         url = reverse('extraction:scan-result', kwargs={'job_id': job.id})
 
         response = api_client.get(url)
@@ -105,7 +108,7 @@ class TestScanWorkflowApi:
 
     def test_fetch_extraction_results_pagination(self, api_client, seeded_completed_job_with_records):
         """Step 3: Verify pagination on extraction results."""
-        job, records = seeded_completed_job_with_records
+        job, _records = seeded_completed_job_with_records
         url = reverse('extraction:scan-result', kwargs={'job_id': job.id})
 
         # Request limit=2, offset=0
@@ -140,7 +143,7 @@ class TestScanWorkflowApi:
 
     def test_remove_job_data_and_verify_404(self, api_client, seeded_completed_job_with_records):
         """Step 8: Remove Job Data (/api/v1/scan/remove/<job_id>) and check 404."""
-        job, records = seeded_completed_job_with_records
+        job, _records = seeded_completed_job_with_records
         remove_url = reverse('extraction:scan-remove', kwargs={'job_id': job.id})
 
         response = api_client.delete(remove_url)
@@ -213,6 +216,7 @@ class TestScanWorkflowApi:
     def test_filter_deduplication_via_api(self, api_client):
         """Deduplication: Different filters create distinct jobs; identical filters reuse active job."""
         from unittest.mock import patch
+
         from apps.extraction.services import ExtractionService
 
         url = reverse('extraction:scan-start')

@@ -1,6 +1,7 @@
 """Django admin interface registrations for extraction models."""
 from django.contrib import admin
-from apps.extraction.models import ExtractionJob, ExtractedRecord
+
+from apps.extraction.models import ExtractedRecord, ExtractionJob
 
 
 class ExtractedRecordInline(admin.TabularInline):

@@ -1,13 +1,15 @@
 """Database query selectors and aggregations for Extraction domain."""
-from typing import Optional, Dict, Any
+from typing import Any
 from uuid import UUID
-from django.db.models import QuerySet, Count, Sum, F, ExpressionWrapper, DurationField, Avg
+
+from django.db.models import Count, QuerySet, Sum
 from django.db.models.functions import Coalesce
 from django.utils import timezone
-from apps.extraction.models import ExtractionJob, ExtractedRecord, JobStatus
+
+from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus
 
 
-def get_job_by_id(job_id: UUID) -> Optional[ExtractionJob]:
+def get_job_by_id(job_id: UUID) -> ExtractionJob | None:
     """Retrieves a single job by UUID or returns None."""
     try:
         return ExtractionJob.objects.filter(id=job_id).first()
@@ -15,7 +17,7 @@ def get_job_by_id(job_id: UUID) -> Optional[ExtractionJob]:
         return None
 
 
-def get_active_job_by_dedup_hash(dedup_hash: str) -> Optional[ExtractionJob]:
+def get_active_job_by_dedup_hash(dedup_hash: str) -> ExtractionJob | None:
     """Finds an existing active (pending or in_progress) job matching identical token + source + filters."""
     if not dedup_hash:
         return None
@@ -25,7 +27,7 @@ def get_active_job_by_dedup_hash(dedup_hash: str) -> Optional[ExtractionJob]:
     ).first()
 
 
-def get_active_job_by_token_hash(token_hash: str, source_type: str = 'crm') -> Optional[ExtractionJob]:
+def get_active_job_by_token_hash(token_hash: str, source_type: str = 'crm') -> ExtractionJob | None:
     """Finds an existing active (pending or in_progress) job for deduplication."""
     return ExtractionJob.objects.filter(
         token_hash=token_hash,
@@ -35,11 +37,11 @@ def get_active_job_by_token_hash(token_hash: str, source_type: str = 'crm') -> O
 
 
 def list_jobs(
-    status: Optional[str] = None,
-    source_type: Optional[str] = None,
-    date_from: Optional[Any] = None,
-    date_to: Optional[Any] = None,
-    search: Optional[str] = None
+    status: str | None = None,
+    source_type: str | None = None,
+    date_from: Any | None = None,
+    date_to: Any | None = None,
+    search: str | None = None
 ) -> QuerySet[ExtractionJob]:
     """Returns an optimized queryset of extraction jobs with optional filtering."""
     qs = ExtractionJob.objects.all().order_by('-created_at')
@@ -63,7 +65,7 @@ def get_job_records(job_id: UUID) -> QuerySet[ExtractedRecord]:
     return ExtractedRecord.objects.filter(job_id=job_id).select_related('job').order_by('id_from_service')
 
 
-def calculate_job_statistics() -> Dict[str, Any]:
+def calculate_job_statistics() -> dict[str, Any]:
     """Computes system-wide aggregate metrics using database queries."""
     total_jobs = ExtractionJob.objects.count()
 
@@ -112,7 +114,7 @@ def calculate_job_statistics() -> Dict[str, Any]:
     }
 
 
-def calculate_job_analytics() -> Dict[str, Any]:
+def calculate_job_analytics() -> dict[str, Any]:
     """Produces detailed analytics breakdown for visualization and reporting."""
     stats = calculate_job_statistics()
 

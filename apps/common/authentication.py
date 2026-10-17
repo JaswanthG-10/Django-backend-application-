@@ -1,12 +1,13 @@
 """API Key and Request Signing Authentication for service endpoints."""
-import time
-import hmac
 import hashlib
+import hmac
 import logging
+import time
+
 from django.conf import settings
+from drf_spectacular.extensions import OpenApiAuthenticationExtension
 from rest_framework.authentication import BaseAuthentication
 from rest_framework.exceptions import AuthenticationFailed
-from drf_spectacular.extensions import OpenApiAuthenticationExtension
 
 logger = logging.getLogger('apps.common.authentication')
 
@@ -52,7 +53,7 @@ class ApiKeyAuthentication(BaseAuthentication):
             try:
                 ts_float = float(provided_ts)
             except (ValueError, TypeError):
-                raise AuthenticationFailed("Invalid X-Timestamp header format. Must be numeric timestamp.")
+                raise AuthenticationFailed("Invalid X-Timestamp header format. Must be numeric timestamp.") from None
 
             tolerance = getattr(settings, 'API_SIGNING_TOLERANCE_SECONDS', 300)
             if abs(time.time() - ts_float) > tolerance:

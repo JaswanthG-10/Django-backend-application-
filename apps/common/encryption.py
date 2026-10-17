@@ -2,14 +2,14 @@
 import base64
 import hashlib
 import logging
-from typing import Optional
+
+from cryptography.fernet import Fernet, InvalidToken
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
-from cryptography.fernet import Fernet, InvalidToken
 
 logger = logging.getLogger('apps.common.encryption')
 
-_fernet_instance: Optional[Fernet] = None
+_fernet_instance: Fernet | None = None
 
 
 def get_fernet() -> Fernet:
@@ -24,7 +24,7 @@ def get_fernet() -> Fernet:
         secret = getattr(settings, 'SECRET_KEY', None)
         if not secret:
             raise ImproperlyConfigured("SECRET_KEY must be configured to initialize field encryption.")
-        derived = base64.urlsafe_b64encode(hashlib.sha256(f"field-encryption-{secret}".encode('utf-8')).digest())
+        derived = base64.urlsafe_b64encode(hashlib.sha256(f"field-encryption-{secret}".encode()).digest())
         _fernet_instance = Fernet(derived)
         return _fernet_instance
 
