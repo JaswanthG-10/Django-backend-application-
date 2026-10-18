@@ -22,17 +22,55 @@ from cryptography.fernet import Fernet
 
 
 def is_tracked_by_git(filepath: Path) -> bool:
-    """Checks whether the specified file is currently tracked by git."""
+    """Checks whether the specified file is currently tracked by git.
+    
+    Fails closed:
+    - Returns True if git confirms the file is tracked.
+    - Returns False only if git explicitly confirms the file is untracked (code 1, pathspec unmatched).
+    - Raises RuntimeError if git is missing, fails, or target is outside a git repository.
+    """
+    target = filepath.resolve()
+    working_dir = target.parent if target.parent.exists() else Path.cwd()
     try:
         res = subprocess.run(
-            ['git', 'ls-files', '--error-unmatch', str(filepath)],
+            ['git', 'ls-files', '--error-unmatch', str(target)],
+            cwd=working_dir,
             capture_output=True,
             text=True,
             check=False,
         )
-        return res.returncode == 0
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError) as exc:
+        raise RuntimeError(
+            f"Git executable is unavailable or failed to execute: {exc}. "
+            "Cannot verify git tracking status; failing closed to prevent secret leakage."
+        ) from exc
+
+    if res.returncode == 0:
+        return True
+
+    stderr_text = res.stderr.lower()
+    stdout_text = res.stdout.lower()
+    if res.returncode == 1 and (
+        "did not match any file" in stderr_text
+        or "did not match any file" in stdout_text
+        or "error: pathspec" in stderr_text
+    ):
         return False
+
+    raise RuntimeError(
+        f"Unable to verify Git tracking status for '{target}': {res.stderr.strip() or 'Unknown git error'} "
+        f"(exit code {res.returncode}). Failing closed."
+    )
+
+
+def validate_fernet_key(key: str) -> None:
+    """Validates that a string is a valid 32-byte url-safe base64-encoded Fernet key."""
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("Encryption key cannot be empty or non-string.")
+    try:
+        Fernet(key.strip().encode('utf-8'))
+    except Exception as exc:
+        raise ValueError(f"Invalid Fernet encryption key format: {exc}") from exc
 
 
 def check_dependent_encrypted_data(primary_key: str | None = None) -> int:
@@ -86,17 +124,23 @@ def rotate_secrets(
     
     Returns a dictionary of action summaries (containing NO secret values).
     """
-    target = env_path.resolve()
+    target = Path(env_path).resolve()
 
     if target.name != '.env':
         raise ValueError(f"Target file must be named exactly '.env' (got '{target.name}').")
 
+    if not target.parent.exists():
+        raise ValueError(f"Target parent directory '{target.parent}' does not exist.")
+
     if is_tracked_by_git(target):
         raise RuntimeError(f"Target file '{target}' is tracked in git repository. Refusing to modify.")
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
     # Read existing content if file exists
     existing_lines: list[str] = []
     old_field_encryption_key: str | None = None
+    old_keys: list[str] = []
     if target.exists():
         existing_lines = target.read_text(encoding='utf-8').splitlines(keepends=True)
         # Scan for existing FIELD_ENCRYPTION_KEY
@@ -106,11 +150,20 @@ def rotate_secrets(
                 old_field_encryption_key = match.group(1).strip()
                 break
 
+        # Validate all existing encryption keys format
+        if old_field_encryption_key:
+            old_keys = [k.strip() for k in old_field_encryption_key.split(',') if k.strip()]
+            for k in old_keys:
+                validate_fernet_key(k)
+
         # Create timestamped backup
-        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         backup_path = target.with_name(f"{target.name}.bak-{timestamp}")
         if not dry_run:
             backup_path.write_text(''.join(existing_lines), encoding='utf-8')
+            try:
+                backup_path.chmod(0o600)
+            except OSError:
+                pass
             backup_msg = f"Created backup: {backup_path.name}"
         else:
             backup_msg = f"[DRY RUN] Would create backup: {backup_path.name}"
@@ -120,34 +173,51 @@ def rotate_secrets(
     new_values: dict[str, str] = {}
 
     if prune_old_keys_only:
-        if not old_field_encryption_key:
+        if not old_field_encryption_key or not old_keys:
             raise ValueError("No FIELD_ENCRYPTION_KEY found in target file to prune.")
-        primary_key = old_field_encryption_key.split(',')[0].strip()
+        primary_key = old_keys[0]
         dep_count = check_dependent_encrypted_data(primary_key=primary_key)
         if dep_count > 0:
-            if reencrypt and not dry_run:
-                reencrypt_stored_data(primary_key=primary_key)
-                dep_count = check_dependent_encrypted_data(primary_key=primary_key)
-            elif reencrypt and dry_run:
-                # In dry run mode, record that reencryption would be attempted
-                dep_count = 0
-            if dep_count > 0 and not force_drop:
+            if reencrypt:
+                if not dry_run:
+                    reencrypt_stored_data(primary_key=primary_key)
+                    dep_count = check_dependent_encrypted_data(primary_key=primary_key)
+                    if dep_count > 0 and not force_drop:
+                        raise RuntimeError(
+                            f"Cannot drop old encryption keys: {dep_count} stored job(s) still depend on fallback keys after re-encryption. "
+                            f"Ensure all records are decryptable or pass '--force-drop'."
+                        )
+                else:
+                    # In dry run mode, record verified count without mutating DB or setting count to 0
+                    pass
+            elif not force_drop:
                 raise RuntimeError(
                     f"Cannot drop old encryption keys: {dep_count} stored job(s) depend on fallback keys. "
                     f"Re-encrypt records first using 'python manage.py reencrypt_tokens' or pass '--reencrypt', "
                     f"or override with '--force-drop'."
                 )
         new_values['FIELD_ENCRYPTION_KEY'] = primary_key
-        fernet_summary = "Pruned FIELD_ENCRYPTION_KEY (retained primary key, dropped old fallback keys)"
+        if dep_count > 0 and reencrypt and dry_run:
+            fernet_summary = (
+                f"Pruned FIELD_ENCRYPTION_KEY (retained primary key; [DRY RUN] would re-encrypt {dep_count} "
+                f"dependent job(s) and drop {len(old_keys) - 1} fallback key{'s' if len(old_keys) != 2 else ''})"
+            )
+        elif dep_count > 0 and force_drop:
+            fernet_summary = (
+                f"Pruned FIELD_ENCRYPTION_KEY (retained primary key, dropped old fallback keys; "
+                f"WARNING: --force-drop applied, {dep_count} dependent job(s) will be unrecoverable)"
+            )
+        else:
+            fernet_summary = "Pruned FIELD_ENCRYPTION_KEY (retained primary key, dropped old fallback keys)"
     else:
         # Generate fresh cryptographic credentials
         new_secret_key = secrets.token_urlsafe(50)
         new_api_key_secret = secrets.token_urlsafe(32)
         new_fernet_key = Fernet.generate_key().decode('utf-8')
+        validate_fernet_key(new_fernet_key)
 
         # Compute rotated FIELD_ENCRYPTION_KEY value
         if keep_old_encryption_key and old_field_encryption_key:
-            old_keys = [k.strip() for k in old_field_encryption_key.split(',') if k.strip()]
             # Preserve old keys with newest primary key first
             combined_keys = [new_fernet_key] + [k for k in old_keys if k != new_fernet_key]
             final_encryption_val = ','.join(combined_keys)
@@ -157,19 +227,40 @@ def rotate_secrets(
             if old_field_encryption_key:
                 dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
                 if dep_count > 0:
-                    if reencrypt and not dry_run:
-                        reencrypt_stored_data(primary_key=new_fernet_key)
-                        dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
-                    elif reencrypt and dry_run:
-                        dep_count = 0
-                    if dep_count > 0 and not force_drop:
+                    if reencrypt:
+                        if not dry_run:
+                            reencrypt_stored_data(primary_key=new_fernet_key)
+                            dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
+                            if dep_count > 0 and not force_drop:
+                                raise RuntimeError(
+                                    f"Cannot drop old encryption key: {dep_count} stored job(s) still depend on fallback keys after re-encryption. "
+                                    f"Ensure all records are decryptable or pass '--force-drop'."
+                                )
+                        else:
+                            # In dry run mode, record verified count without mutating DB or resetting to 0
+                            pass
+                    elif not force_drop:
                         raise RuntimeError(
                             f"Cannot drop old encryption key: {dep_count} stored job(s) depend on fallback keys. "
                             f"Re-encrypt records first using 'python manage.py reencrypt_tokens' or pass '--reencrypt', "
                             f"or override with '--force-drop'."
                         )
-            final_encryption_val = new_fernet_key
-            fernet_summary = "Rotated FIELD_ENCRYPTION_KEY (primary key replaced, old keys dropped)"
+                final_encryption_val = new_fernet_key
+                if dep_count > 0 and reencrypt and dry_run:
+                    fernet_summary = (
+                        f"Rotated FIELD_ENCRYPTION_KEY (new primary; [DRY RUN] would re-encrypt {dep_count} "
+                        f"dependent job(s) before dropping old keys)"
+                    )
+                elif dep_count > 0 and force_drop:
+                    fernet_summary = (
+                        f"Rotated FIELD_ENCRYPTION_KEY (primary key replaced, old keys dropped; "
+                        f"WARNING: --force-drop applied, {dep_count} dependent job(s) will be unrecoverable)"
+                    )
+                else:
+                    fernet_summary = "Rotated FIELD_ENCRYPTION_KEY (primary key replaced, old keys dropped)"
+            else:
+                final_encryption_val = new_fernet_key
+                fernet_summary = "Generated fresh FIELD_ENCRYPTION_KEY"
 
         new_values = {
             'SECRET_KEY': new_secret_key,
@@ -201,14 +292,33 @@ def rotate_secrets(
         for key in missing_keys:
             output_lines.append(f"{key}={new_values[key]}\n")
 
-    # Write securely directly to disk (unless dry-run)
+    # Write securely directly to disk using atomic replacement (unless dry-run)
     if not dry_run:
-        target.write_text(''.join(output_lines), encoding='utf-8')
+        temp_file = target.with_name(f"{target.name}.tmp-{timestamp}-{secrets.token_hex(4)}")
+        try:
+            temp_file.write_text(''.join(output_lines), encoding='utf-8')
+            try:
+                temp_file.chmod(0o600)
+            except OSError:
+                pass
+            temp_file.replace(target)
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+        except Exception:
+            if temp_file.exists():
+                try:
+                    temp_file.unlink()
+                except OSError:
+                    pass
+            raise
 
     prefix = "[DRY RUN] " if dry_run else ""
+    summary_text = fernet_summary if fernet_summary.startswith("[DRY RUN]") else f"{prefix}{fernet_summary}"
     result = {
         'backup': backup_msg,
-        'FIELD_ENCRYPTION_KEY': f"{prefix}{fernet_summary}",
+        'FIELD_ENCRYPTION_KEY': summary_text,
     }
     if 'SECRET_KEY' in new_values:
         result['SECRET_KEY'] = f"{prefix}Rotated SECRET_KEY"

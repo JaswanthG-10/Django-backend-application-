@@ -25,7 +25,9 @@ from config.settings import (
 )
 from scripts.rotate_secrets import (
     check_dependent_encrypted_data,
+    is_tracked_by_git,
     rotate_secrets,
+    validate_fernet_key,
 )
 from scripts.rotate_secrets import (
     main as rotate_secrets_main,
@@ -499,7 +501,8 @@ class TestKeyRotationSafeguardsAndReencryption:
     def test_rotate_secrets_dry_run_makes_no_modifications(self, tmp_path, monkeypatch):
         """--dry-run simulates the secret rotation without creating backup files or modifying target .env."""
         env_file = tmp_path / '.env'
-        original_content = "SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY=old-key\n"
+        valid_key = Fernet.generate_key().decode('utf-8')
+        original_content = f"SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY={valid_key}\n"
         env_file.write_text(original_content, encoding='utf-8')
 
         monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
@@ -519,24 +522,17 @@ class TestKeyRotationSafeguardsAndReencryption:
     def test_rotate_secrets_interrupted_rotation_preserves_backup(self, tmp_path, monkeypatch):
         """If rotation is interrupted before completion, the timestamped backup remains intact for rollback."""
         env_file = tmp_path / '.env'
-        original_content = "SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY=old-key\n"
+        valid_key = Fernet.generate_key().decode('utf-8')
+        original_content = f"SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY={valid_key}\n"
         env_file.write_text(original_content, encoding='utf-8')
 
         monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
 
-        # Simulate interruption during output lines preparation
-        def mock_error_during_processing(*args, **kwargs):
-            raise OSError("Disk write failed: unexpected interruption")
+        # Monkeypatch Path.replace on the target to simulate error after backup creation
+        def failing_replace(self, target):
+            raise OSError("Disk write failed: disk full or power failure")
 
-        # Monkeypatch Path.write_text on the target to simulate error after backup creation
-        original_write_text = Path.write_text
-
-        def failing_write_text(self, data, *args, **kwargs):
-            if self.name == '.env':
-                raise OSError("Disk write failed: disk full or power failure")
-            return original_write_text(self, data, *args, **kwargs)
-
-        monkeypatch.setattr(Path, 'write_text', failing_write_text)
+        monkeypatch.setattr(Path, 'replace', failing_replace)
 
         with pytest.raises(OSError, match="Disk write failed"):
             rotate_secrets(env_file, dry_run=False)
@@ -545,4 +541,183 @@ class TestKeyRotationSafeguardsAndReencryption:
         backup_files = list(tmp_path.glob('.env.bak-*'))
         assert len(backup_files) == 1
         assert backup_files[0].read_text(encoding='utf-8') == original_content
+
+    def test_is_tracked_by_git_fails_closed_when_git_unavailable(self, tmp_path, monkeypatch):
+        """is_tracked_by_git raises RuntimeError if git executable is missing or cannot execute."""
+        def mock_git_missing(*args, **kwargs):
+            raise FileNotFoundError("git: command not found")
+
+        monkeypatch.setattr(subprocess, 'run', mock_git_missing)
+        with pytest.raises(RuntimeError, match="Git executable is unavailable"):
+            is_tracked_by_git(tmp_path / '.env')
+
+    def test_is_tracked_by_git_fails_closed_on_non_repository_path(self, tmp_path, monkeypatch):
+        """is_tracked_by_git raises RuntimeError if the path is outside any git repository (code 128)."""
+        mock_result = subprocess.CompletedProcess(
+            args=['git', 'ls-files', '--error-unmatch'],
+            returncode=128,
+            stdout='',
+            stderr='fatal: not a git repository (or any of the parent directories): .git\n'
+        )
+        monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: mock_result)
+        with pytest.raises(RuntimeError, match="Unable to verify Git tracking status"):
+            is_tracked_by_git(tmp_path / '.env')
+
+    def test_is_tracked_by_git_returns_true_for_tracked_file(self, tmp_path, monkeypatch):
+        """is_tracked_by_git returns True when git exit code is 0 (file is tracked)."""
+        mock_result = subprocess.CompletedProcess(
+            args=['git', 'ls-files', '--error-unmatch'],
+            returncode=0,
+            stdout='.env\n',
+            stderr=''
+        )
+        monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: mock_result)
+        assert is_tracked_by_git(tmp_path / '.env') is True
+
+    def test_is_tracked_by_git_returns_false_for_confirmed_untracked_file(self, tmp_path, monkeypatch):
+        """is_tracked_by_git returns False when git confirms error-unmatch did not match any file."""
+        mock_result = subprocess.CompletedProcess(
+            args=['git', 'ls-files', '--error-unmatch'],
+            returncode=1,
+            stdout='',
+            stderr="error: pathspec '.env' did not match any file(s) known to git\n"
+        )
+        monkeypatch.setattr(subprocess, 'run', lambda *args, **kwargs: mock_result)
+        assert is_tracked_by_git(tmp_path / '.env') is False
+
+    def test_validate_fernet_key_rejects_malformed_keys(self):
+        """validate_fernet_key raises ValueError for non-string, empty, truncated, or invalid base64 keys."""
+        with pytest.raises(ValueError, match="Encryption key cannot be empty"):
+            validate_fernet_key("")
+        with pytest.raises(ValueError, match="Encryption key cannot be empty"):
+            validate_fernet_key("   ")
+        with pytest.raises(ValueError, match="Invalid Fernet encryption key format"):
+            validate_fernet_key("not-base64-at-all!!")
+        with pytest.raises(ValueError, match="Invalid Fernet encryption key format"):
+            validate_fernet_key("dGVzdA==")
+
+        valid = Fernet.generate_key().decode('utf-8')
+        validate_fernet_key(valid)
+
+    def test_rotate_secrets_rejects_invalid_primary_or_fallback_fernet_keys(self, tmp_path, monkeypatch):
+        """rotate_secrets validates all existing keys and raises ValueError on malformed keys even with force_drop."""
+        env_file = tmp_path / '.env'
+        valid_key = Fernet.generate_key().decode('utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        # 1. Invalid primary key
+        env_file.write_text("FIELD_ENCRYPTION_KEY=corrupted-primary-key\n", encoding='utf-8')
+        with pytest.raises(ValueError, match="Invalid Fernet encryption key format"):
+            rotate_secrets(env_file, force_drop=True)
+
+        # 2. Valid primary key but corrupted fallback key
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={valid_key},corrupted-fallback-key\n", encoding='utf-8')
+        with pytest.raises(ValueError, match="Invalid Fernet encryption key format"):
+            rotate_secrets(env_file, force_drop=True)
+
+    def test_rotate_secrets_dry_run_with_reencrypt_proves_zero_db_and_disk_mutations(self, tmp_path, db, monkeypatch):
+        """--dry-run with dependent records and --reencrypt proves no database or filesystem changes occur."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        fernet_old = Fernet(old_key.encode('utf-8'))
+
+        # Create 2 database records encrypted under old key
+        job1 = ExtractionJob.objects.create(
+            encrypted_token=fernet_old.encrypt(b"crm-tok-1").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("crm-tok-1"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("crm-tok-1"),
+        )
+        job2 = ExtractionJob.objects.create(
+            encrypted_token=fernet_old.encrypt(b"crm-tok-2").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("crm-tok-2"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("crm-tok-2"),
+        )
+
+        initial_cipher1 = job1.encrypted_token
+        initial_cipher2 = job2.encrypted_token
+
+        env_file = tmp_path / '.env'
+        original_env_content = f"FIELD_ENCRYPTION_KEY={old_key}\nSECRET_KEY=original-secret\n"
+        env_file.write_text(original_env_content, encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        # Execute dry-run with drop_old_encryption_key and reencrypt
+        result = rotate_secrets(
+            env_file,
+            keep_old_encryption_key=False,
+            reencrypt=True,
+            dry_run=True,
+        )
+
+        assert "[DRY RUN]" in result['FIELD_ENCRYPTION_KEY']
+        assert "would re-encrypt 2 dependent job(s)" in result['FIELD_ENCRYPTION_KEY']
+
+        # Verify .env file is completely untouched
+        assert env_file.read_text(encoding='utf-8') == original_env_content
+        # Verify no backup files created
+        assert len(list(tmp_path.glob('.env.bak-*'))) == 0
+
+        # Verify database records were NOT mutated
+        job1.refresh_from_db()
+        job2.refresh_from_db()
+        assert job1.encrypted_token == initial_cipher1
+        assert job2.encrypted_token == initial_cipher2
+
+    def test_rotate_secrets_fails_closed_when_db_unavailable_during_check(self, tmp_path, monkeypatch):
+        """rotate_secrets fails closed if database is unreachable during dependency verification."""
+        env_file = tmp_path / '.env'
+        key = Fernet.generate_key().decode('utf-8')
+        original_content = f"FIELD_ENCRYPTION_KEY={key}\n"
+        env_file.write_text(original_content, encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        def failing_db_check(primary_key=None):
+            raise RuntimeError("Database connection refused (PostgreSQL socket closed)")
+
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', failing_db_check)
+
+        with pytest.raises(RuntimeError, match="Database connection refused"):
+            rotate_secrets(env_file, keep_old_encryption_key=False)
+
+        # .env remains unmodified
+        assert env_file.read_text(encoding='utf-8') == original_content
+
+    def test_rotate_secrets_atomic_write_and_permission_enforcement(self, tmp_path, monkeypatch):
+        """rotate_secrets writes via atomic replacement with 0o600 permissions."""
+        env_file = tmp_path / '.env'
+        valid_key = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={valid_key}\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        replaced_files = []
+        chmod_calls = []
+
+        real_replace = Path.replace
+        real_chmod = Path.chmod
+
+        def tracked_replace(self, target):
+            replaced_files.append((self.name, target.name))
+            return real_replace(self, target)
+
+        def tracked_chmod(self, mode):
+            chmod_calls.append((self.name, mode))
+            return real_chmod(self, mode)
+
+        monkeypatch.setattr(Path, 'replace', tracked_replace)
+        monkeypatch.setattr(Path, 'chmod', tracked_chmod)
+
+        result = rotate_secrets(env_file)
+        assert "Rotated" in result['FIELD_ENCRYPTION_KEY']
+
+        # Ensure atomic replacement was used: tmp file replaced target .env
+        assert len(replaced_files) == 1
+        src_name, dst_name = replaced_files[0]
+        assert src_name.startswith('.env.tmp-')
+        assert dst_name == '.env'
+
+        # Ensure restrictive mode 0o600 was applied
+        assert any(mode == 0o600 for _, mode in chmod_calls)
 

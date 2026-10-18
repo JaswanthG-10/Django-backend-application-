@@ -4,6 +4,7 @@ import email.utils
 import hashlib
 import hmac
 import json
+import threading
 import time
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -18,6 +19,7 @@ from django.utils import timezone
 from rest_framework import status
 
 from apps.common.exceptions import (
+    ExternalServiceAuthError,
     ExternalServiceError,
     PageLimitExceededError,
     RateLimitExceededError,
@@ -1206,4 +1208,119 @@ class TestPageCapAndRateLimitBudgets:
         assert example_config('EXTERNAL_API_ON_PAGE_LIMIT') == 'fail'
         assert example_config('EXTERNAL_API_MAX_RATE_LIMIT_RETRIES', cast=int) == 5
         assert example_config('EXTERNAL_API_MAX_TOTAL_RATE_LIMIT_WAIT_SECONDS', cast=float) == 300.0
+
+
+@pytest.mark.django_db(transaction=True)
+class TestTargetedConcurrencyAndSecurityEdgeCases:
+    """Targeted tests for job processing, claiming concurrency, and security isolation."""
+
+    def test_concurrent_job_claim_no_duplicate_winners(self):
+        """Claim Concurrency: Simultaneous claim attempts on the same job result in exactly one winner."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="tok-claim-race",
+            dedup_hash="dedup-claim-race",
+            status=JobStatus.PENDING,
+        )
+        job.set_encrypted_token("tok-claim-race-val")
+        job.save()
+
+        claim_results = []
+        barrier = threading.Barrier(2)
+
+        def attempt_claim():
+            from django.db import connection
+            connection.close_if_unusable_or_obsolete()
+            try:
+                barrier.wait(timeout=5)
+                claimed = ExtractionService.claim_job(job_id=job.id)
+                claim_results.append(claimed)
+            finally:
+                connection.close_if_unusable_or_obsolete()
+
+        t1 = threading.Thread(target=attempt_claim)
+        t2 = threading.Thread(target=attempt_claim)
+        t1.start()
+        t2.start()
+        t1.join(timeout=10)
+        t2.join(timeout=10)
+
+        # Exactly one thread got the job, the other got None
+        winners = [c for c in claim_results if c is not None]
+        losers = [c for c in claim_results if c is None]
+        assert len(winners) == 1
+        assert len(losers) == 1
+        assert winners[0].id == job.id
+
+    def test_active_worker_heartbeat_survives_concurrent_stale_recovery(self):
+        """Active Worker Safety: A job whose worker updates its heartbeat is never recovered as stale."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="tok-active-hb",
+            dedup_hash="dedup-active-hb",
+            status=JobStatus.IN_PROGRESS,
+            start_time=timezone.now() - timezone.timedelta(minutes=30),
+            heartbeat_at=timezone.now(),  # fresh heartbeat
+            retry_count=0,
+            max_retries=3,
+        )
+        job.set_encrypted_token("active-token")
+        job.save()
+
+        # Run recovery
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 0
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.IN_PROGRESS
+
+    def test_dispatch_background_extraction_handles_executor_failure(self):
+        """Dispatch Reliability: If executor submission fails, job remains pending and recoverable."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="tok-dispatch-fail",
+            dedup_hash="dedup-dispatch-fail",
+            status=JobStatus.PENDING,
+        )
+        job.set_encrypted_token("secret-token-val")
+        job.save()
+
+        with patch('apps.extraction.services.get_extraction_executor') as mock_get_exec:
+            mock_exec = MagicMock()
+            mock_exec.submit.side_effect = RuntimeError("Executor queue full")
+            mock_get_exec.return_value = mock_exec
+
+            # Attempting dispatch raises or handles gracefully
+            with pytest.raises(RuntimeError, match="Executor queue full"):
+                ExtractionService.dispatch_background_extraction(job_id=job.id)
+
+        # Job remains in pending status for subsequent worker claim or retry
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+
+    def test_authorization_header_and_credentials_never_leaked_in_logs_or_errors(self, caplog):
+        """Security: Authorization headers and plaintext tokens are completely omitted from logs and error details."""
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+        raw_secret_token = "super-secret-pat-token-7777777"
+
+        # Simulate external provider returning 401 with error response
+        with patch.object(client.session, 'get') as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 401
+            mock_resp.headers = {'Content-Type': 'application/json'}
+            mock_resp.text = json.dumps({'error': 'Unauthorized', 'detail': 'Invalid API Key'})
+            mock_resp.json.return_value = {'error': 'Unauthorized', 'detail': 'Invalid API Key'}
+            mock_get.return_value = mock_resp
+
+            with pytest.raises(ExternalServiceAuthError) as exc_info:
+                client.extract_data(api_token=raw_secret_token, source_type="crm")
+
+            # Check exception representation does not contain secret token
+            exc_str = str(exc_info.value)
+            assert raw_secret_token not in exc_str
+
+            # Check log records do not contain secret token
+            for record in caplog.records:
+                assert raw_secret_token not in record.message
+
 
