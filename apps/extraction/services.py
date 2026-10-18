@@ -552,18 +552,21 @@ class ExtractionService:
         
         Returns:
             Number of jobs whose tokens fail decryption under primary_key alone.
+
+        Raises:
+            ValueError: If no key is provided/configured, or if the key is invalid.
         """
         from cryptography.fernet import Fernet, InvalidToken
         target_key = primary_key or getattr(settings, 'FIELD_ENCRYPTION_KEY', None)
         if not target_key:
-            return 0
+            raise ValueError("No primary encryption key provided or configured in settings.")
         if isinstance(target_key, str) and ',' in target_key:
             target_key = target_key.split(',')[0].strip()
 
         try:
             fernet = Fernet(target_key.encode('utf-8') if isinstance(target_key, str) else target_key)
-        except (ValueError, TypeError):
-            return 0
+        except Exception as exc:
+            raise ValueError(f"Invalid primary encryption key provided: {exc}") from exc
 
         dependent_count = 0
         for job in ExtractionJob.objects.exclude(encrypted_token=''):

@@ -38,7 +38,10 @@ def is_tracked_by_git(filepath: Path) -> bool:
 def check_dependent_encrypted_data(primary_key: str | None = None) -> int:
     """Checks whether any stored database records depend on older encryption keys.
     
-    Returns 0 if no records depend on old keys, or if Django/database is unavailable.
+    Returns 0 if and only if a successful database query confirms no stored records
+    depend on older keys.
+    Fails closed: raises RuntimeError on database connection, configuration, decryption,
+    or environment error.
     """
     try:
         import os
@@ -49,8 +52,11 @@ def check_dependent_encrypted_data(primary_key: str | None = None) -> int:
         django.setup()
         from apps.extraction.services import ExtractionService
         return ExtractionService.count_jobs_dependent_on_old_keys(primary_key=primary_key)
-    except Exception:  # noqa: BLE001  # Safe fallback if database or Django environment is unavailable
-        return 0
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to verify dependent encrypted data: {exc}. "
+            "Failing closed to prevent potential data loss. Ensure database is reachable or use --force-drop."
+        ) from exc
 
 
 def reencrypt_stored_data(primary_key: str | None = None) -> int:
@@ -74,6 +80,7 @@ def rotate_secrets(
     force_drop: bool = False,
     reencrypt: bool = False,
     prune_old_keys_only: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, str]:
     """Rotates SECRET_KEY, API_KEY_SECRET, and FIELD_ENCRYPTION_KEY in the specified .env file.
     
@@ -102,10 +109,13 @@ def rotate_secrets(
         # Create timestamped backup
         timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         backup_path = target.with_name(f"{target.name}.bak-{timestamp}")
-        backup_path.write_text(''.join(existing_lines), encoding='utf-8')
-        backup_msg = f"Created backup: {backup_path.name}"
+        if not dry_run:
+            backup_path.write_text(''.join(existing_lines), encoding='utf-8')
+            backup_msg = f"Created backup: {backup_path.name}"
+        else:
+            backup_msg = f"[DRY RUN] Would create backup: {backup_path.name}"
     else:
-        backup_msg = "Target file did not exist; creating fresh .env"
+        backup_msg = "[DRY RUN] Target file does not exist; would create fresh .env" if dry_run else "Target file did not exist; creating fresh .env"
 
     new_values: dict[str, str] = {}
 
@@ -115,9 +125,12 @@ def rotate_secrets(
         primary_key = old_field_encryption_key.split(',')[0].strip()
         dep_count = check_dependent_encrypted_data(primary_key=primary_key)
         if dep_count > 0:
-            if reencrypt:
+            if reencrypt and not dry_run:
                 reencrypt_stored_data(primary_key=primary_key)
                 dep_count = check_dependent_encrypted_data(primary_key=primary_key)
+            elif reencrypt and dry_run:
+                # In dry run mode, record that reencryption would be attempted
+                dep_count = 0
             if dep_count > 0 and not force_drop:
                 raise RuntimeError(
                     f"Cannot drop old encryption keys: {dep_count} stored job(s) depend on fallback keys. "
@@ -144,9 +157,11 @@ def rotate_secrets(
             if old_field_encryption_key:
                 dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
                 if dep_count > 0:
-                    if reencrypt:
+                    if reencrypt and not dry_run:
                         reencrypt_stored_data(primary_key=new_fernet_key)
                         dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
+                    elif reencrypt and dry_run:
+                        dep_count = 0
                     if dep_count > 0 and not force_drop:
                         raise RuntimeError(
                             f"Cannot drop old encryption key: {dep_count} stored job(s) depend on fallback keys. "
@@ -186,17 +201,21 @@ def rotate_secrets(
         for key in missing_keys:
             output_lines.append(f"{key}={new_values[key]}\n")
 
-    # Write securely directly to disk
-    target.write_text(''.join(output_lines), encoding='utf-8')
+    # Write securely directly to disk (unless dry-run)
+    if not dry_run:
+        target.write_text(''.join(output_lines), encoding='utf-8')
 
+    prefix = "[DRY RUN] " if dry_run else ""
     result = {
         'backup': backup_msg,
-        'FIELD_ENCRYPTION_KEY': fernet_summary,
+        'FIELD_ENCRYPTION_KEY': f"{prefix}{fernet_summary}",
     }
     if 'SECRET_KEY' in new_values:
-        result['SECRET_KEY'] = 'Rotated SECRET_KEY'
+        result['SECRET_KEY'] = f"{prefix}Rotated SECRET_KEY"
     if 'API_KEY_SECRET' in new_values:
-        result['API_KEY_SECRET'] = 'Rotated API_KEY_SECRET'
+        result['API_KEY_SECRET'] = f"{prefix}Rotated API_KEY_SECRET"
+    if dry_run:
+        result['dry_run'] = "[DRY RUN] Completed simulation without making persistent modifications."
 
     return result
 
@@ -238,6 +257,11 @@ def main(argv: list[str] | None = None) -> int:
         action='store_true',
         help="Drop old fallback encryption keys while keeping current primary key without generating a new key."
     )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help="Simulate the secret rotation process without making any changes to disk or database."
+    )
 
     args = parser.parse_args(argv)
 
@@ -250,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
             force_drop=args.force_drop,
             reencrypt=args.reencrypt,
             prune_old_keys_only=args.prune_old_keys,
+            dry_run=args.dry_run,
         )
         for summary in results.values():
             print(summary)

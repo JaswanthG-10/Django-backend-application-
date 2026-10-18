@@ -24,10 +24,11 @@ from config.settings import (
     _is_prohibited_hash,
 )
 from scripts.rotate_secrets import (
-    main as rotate_secrets_main,
+    check_dependent_encrypted_data,
+    rotate_secrets,
 )
 from scripts.rotate_secrets import (
-    rotate_secrets,
+    main as rotate_secrets_main,
 )
 
 
@@ -202,6 +203,7 @@ class TestRotateSecretsScript:
         )
 
         monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+        monkeypatch.setattr('scripts.rotate_secrets.check_dependent_encrypted_data', lambda primary_key=None: 0)
 
         exit_code = rotate_secrets_main(['--env-file', str(env_file), '--drop-old-encryption-key'])
         assert exit_code == 0
@@ -435,4 +437,112 @@ class TestKeyRotationSafeguardsAndReencryption:
         updated_content = env_file.read_text(encoding='utf-8')
         assert f"FIELD_ENCRYPTION_KEY={key1}\n" in updated_content
         assert key2 not in updated_content
+
+    def test_check_dependent_encrypted_data_zero_records(self, db):
+        """check_dependent_encrypted_data returns 0 when no stored jobs depend on old keys."""
+        valid_key = Fernet.generate_key().decode('utf-8')
+        count = check_dependent_encrypted_data(primary_key=valid_key)
+        assert count == 0
+
+    def test_check_dependent_encrypted_data_existing_records(self, db):
+        """check_dependent_encrypted_data accurately counts jobs encrypted with old keys."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        new_key = Fernet.generate_key().decode('utf-8')
+        f_old = Fernet(old_key.encode('utf-8'))
+
+        ExtractionJob.objects.create(
+            encrypted_token=f_old.encrypt(b"token-dep-1").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("token-dep-1"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("token-dep-1"),
+        )
+        ExtractionJob.objects.create(
+            encrypted_token=f_old.encrypt(b"token-dep-2").decode('utf-8'),
+            token_hash=ExtractionJob.hash_token("token-dep-2"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("token-dep-2"),
+        )
+
+        count = check_dependent_encrypted_data(primary_key=new_key)
+        assert count == 2
+
+    def test_check_dependent_encrypted_data_fails_closed_on_db_failure(self, monkeypatch):
+        """check_dependent_encrypted_data raises RuntimeError on database failure (fails closed, never returns 0)."""
+        def mock_failing_query(*args, **kwargs):
+            raise RuntimeError("Database connection refused: [Errno 111] Connection refused")
+
+        monkeypatch.setattr(ExtractionService, 'count_jobs_dependent_on_old_keys', mock_failing_query)
+
+        valid_key = Fernet.generate_key().decode('utf-8')
+        with pytest.raises(RuntimeError) as exc_info:
+            check_dependent_encrypted_data(primary_key=valid_key)
+        assert "Failing closed" in str(exc_info.value)
+        assert "Database connection refused" in str(exc_info.value)
+
+    def test_check_dependent_encrypted_data_fails_closed_on_missing_key(self, settings):
+        """check_dependent_encrypted_data raises RuntimeError when primary_key is missing or invalid."""
+        settings.FIELD_ENCRYPTION_KEY = None
+        with pytest.raises(RuntimeError) as exc_info:
+            check_dependent_encrypted_data(primary_key="")
+        assert "Failing closed" in str(exc_info.value)
+
+    def test_count_jobs_dependent_handles_malformed_ciphertext(self, db):
+        """Malformed ciphertext in encrypted_token fails decryption and is counted as dependent."""
+        key = Fernet.generate_key().decode('utf-8')
+        ExtractionJob.objects.create(
+            encrypted_token="malformed_non_fernet_garbage_ciphertext",
+            token_hash=ExtractionJob.hash_token("malformed"),
+            dedup_hash=ExtractionJob.compute_dedup_hash("malformed"),
+        )
+
+        count = ExtractionService.count_jobs_dependent_on_old_keys(primary_key=key)
+        assert count == 1
+
+    def test_rotate_secrets_dry_run_makes_no_modifications(self, tmp_path, monkeypatch):
+        """--dry-run simulates the secret rotation without creating backup files or modifying target .env."""
+        env_file = tmp_path / '.env'
+        original_content = "SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY=old-key\n"
+        env_file.write_text(original_content, encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        result = rotate_secrets(env_file, dry_run=True)
+        assert "[DRY RUN]" in result['FIELD_ENCRYPTION_KEY']
+        assert "[DRY RUN]" in result['backup']
+        assert "dry_run" in result
+
+        # Verify .env was not modified
+        assert env_file.read_text(encoding='utf-8') == original_content
+
+        # Verify no backup file was created
+        backup_files = list(tmp_path.glob('.env.bak-*'))
+        assert len(backup_files) == 0
+
+    def test_rotate_secrets_interrupted_rotation_preserves_backup(self, tmp_path, monkeypatch):
+        """If rotation is interrupted before completion, the timestamped backup remains intact for rollback."""
+        env_file = tmp_path / '.env'
+        original_content = "SECRET_KEY=original-secret-key-12345678901234567890\nFIELD_ENCRYPTION_KEY=old-key\n"
+        env_file.write_text(original_content, encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        # Simulate interruption during output lines preparation
+        def mock_error_during_processing(*args, **kwargs):
+            raise OSError("Disk write failed: unexpected interruption")
+
+        # Monkeypatch Path.write_text on the target to simulate error after backup creation
+        original_write_text = Path.write_text
+
+        def failing_write_text(self, data, *args, **kwargs):
+            if self.name == '.env':
+                raise OSError("Disk write failed: disk full or power failure")
+            return original_write_text(self, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, 'write_text', failing_write_text)
+
+        with pytest.raises(OSError, match="Disk write failed"):
+            rotate_secrets(env_file, dry_run=False)
+
+        # Backup file was already written before target modification and is intact!
+        backup_files = list(tmp_path.glob('.env.bak-*'))
+        assert len(backup_files) == 1
+        assert backup_files[0].read_text(encoding='utf-8') == original_content
 
