@@ -31,6 +31,7 @@ def mock_dns_for_offline_test_domains(monkeypatch):
         'unintended-external-service.org': '93.184.215.14',
         'crm-provider.test': '93.184.215.15',
         'api.crm-provider.test': '93.184.215.15',
+        'api.thirdparty-crm.com': '93.184.215.17',
         'jsonplaceholder.typicode.com': '104.21.4.197',
         'crm.myenterprise.com': '93.184.215.16',
     }
