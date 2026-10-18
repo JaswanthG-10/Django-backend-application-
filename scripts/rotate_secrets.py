@@ -20,6 +20,11 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
+# Ensure project root is in sys.path when invoked directly as a script
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
 
 def is_tracked_by_git(filepath: Path) -> bool:
     """Checks whether the specified file is currently tracked by git.
