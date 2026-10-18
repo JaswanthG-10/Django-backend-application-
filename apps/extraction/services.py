@@ -579,27 +579,43 @@ class ExtractionService:
 
     @classmethod
     @transaction.atomic
-    def reencrypt_all_jobs(cls, primary_key: str | None = None) -> int:
+    def reencrypt_all_jobs(cls, primary_key: str | None = None, fallback_keys: list[str] | None = None) -> int:
         """Re-encrypts all active extraction jobs using the current primary encryption key.
         
         Uses the active MultiFernet instance (which can decrypt using any valid fallback key),
-        then re-encrypts the token with the primary key.
+        or provided fallback_keys, then re-encrypts the token with the primary key.
         Verifies that each re-encrypted token successfully decrypts with primary_key alone.
         
         Returns:
             Number of successfully re-encrypted jobs.
         """
-        from cryptography.fernet import Fernet
+        from cryptography.fernet import Fernet, InvalidToken, MultiFernet
         target_key = primary_key or getattr(settings, 'FIELD_ENCRYPTION_KEY', None)
         if isinstance(target_key, str) and ',' in target_key:
             target_key = target_key.split(',')[0].strip()
 
         fernet_primary = Fernet(target_key.encode('utf-8') if isinstance(target_key, str) else target_key) if target_key else None
 
+        decrypt_cipher = None
+        if fallback_keys:
+            all_fallback = [target_key] if target_key else []
+            for k in fallback_keys:
+                if k not in all_fallback:
+                    all_fallback.append(k)
+            decrypt_cipher = MultiFernet([Fernet(k.encode('utf-8') if isinstance(k, str) else k) for k in all_fallback])
+
         reencrypted_count = 0
         jobs_to_update = list(ExtractionJob.objects.exclude(encrypted_token=''))
         for job in jobs_to_update:
-            token = job.get_decrypted_token()
+            token = None
+            if decrypt_cipher:
+                try:
+                    token = decrypt_cipher.decrypt(job.encrypted_token.encode('utf-8')).decode('utf-8')
+                except (InvalidToken, ValueError, TypeError):
+                    token = job.get_decrypted_token()
+            else:
+                token = job.get_decrypted_token()
+
             if not token:
                 logger.warning("Skipping job %s: unable to decrypt stored token with existing keys.", job.id)
                 continue

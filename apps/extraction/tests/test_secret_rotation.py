@@ -412,7 +412,7 @@ class TestKeyRotationSafeguardsAndReencryption:
         def mock_check(primary_key=None):
             return checks.pop(0) if checks else 0
 
-        def mock_reencrypt(primary_key=None):
+        def mock_reencrypt(primary_key=None, **kwargs):
             reencrypt_called.append(True)
             return 2
 
@@ -720,4 +720,127 @@ class TestKeyRotationSafeguardsAndReencryption:
 
         # Ensure restrictive mode 0o600 was applied
         assert any(mode == 0o600 for _, mode in chmod_calls)
+
+    def test_is_tracked_by_git_real_git_repository_tracked_and_untracked(self, tmp_path):
+        """Verifies is_tracked_by_git against a real Git repository, testing tracked, untracked, and non-repo paths."""
+        repo_dir = tmp_path / "test_repo"
+        repo_dir.mkdir()
+
+        # Initialize real git repo
+        subprocess.run(['git', 'init'], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.email', 'test@test.org'], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'config', 'user.name', 'Test User'], cwd=repo_dir, check=True, capture_output=True)
+
+        env_file = repo_dir / ".env"
+        valid_key = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={valid_key}\n", encoding='utf-8')
+
+        # 1. Untracked file in real git repo -> returns False
+        assert is_tracked_by_git(env_file) is False
+
+        # rotate_secrets succeeds on untracked file in real git repo
+        res = rotate_secrets(env_file)
+        assert "Rotated" in res['FIELD_ENCRYPTION_KEY']
+
+        # 2. Stage and commit .env in real git repo -> is_tracked_by_git returns True
+        subprocess.run(['git', 'add', '.env'], cwd=repo_dir, check=True, capture_output=True)
+        subprocess.run(['git', 'commit', '-m', 'commit env'], cwd=repo_dir, check=True, capture_output=True)
+        assert is_tracked_by_git(env_file) is True
+
+        # rotate_secrets refuses to modify tracked file in real git repo
+        with pytest.raises(RuntimeError, match="tracked in git repository"):
+            rotate_secrets(env_file)
+
+        # 3. Path outside any git repository -> fails closed (RuntimeError)
+        outside_dir = tmp_path / "outside_repo"
+        outside_dir.mkdir()
+        outside_env = outside_dir / ".env"
+        outside_env.write_text("FOO=BAR\n", encoding='utf-8')
+        with pytest.raises(RuntimeError, match="Unable to verify Git tracking status"):
+            is_tracked_by_git(outside_env)
+
+    def test_rotate_secrets_backup_collision_avoids_overwriting_prior_backup(self, tmp_path, monkeypatch):
+        """If a backup file with the timestamp already exists, rotate_secrets uses a unique suffix without overwriting."""
+        env_file = tmp_path / '.env'
+        valid_key = Fernet.generate_key().decode('utf-8')
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={valid_key}\nSECRET_KEY=initial\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        # Pre-create a colliding backup file
+        from datetime import UTC, datetime
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        existing_backup = tmp_path / f".env.bak-{timestamp}"
+        existing_backup.write_text("PRIOR_BACKUP_CONTENT_DO_NOT_OVERWRITE", encoding='utf-8')
+
+        # Execute rotation
+        result = rotate_secrets(env_file)
+        assert "Created backup" in result['backup']
+
+        # Verify prior backup content was NOT overwritten
+        assert existing_backup.read_text(encoding='utf-8') == "PRIOR_BACKUP_CONTENT_DO_NOT_OVERWRITE"
+
+        # Verify a new collision-safe backup was created
+        all_backups = list(tmp_path.glob('.env.bak-*'))
+        assert len(all_backups) == 2
+
+    def test_rotate_secrets_reencrypt_real_database_migration(self, tmp_path, db, monkeypatch):
+        """Verifies that rotate_secrets --reencrypt migrates real database records before dropping old key."""
+        old_key = Fernet.generate_key().decode('utf-8')
+        f_old = Fernet(old_key.encode('utf-8'))
+
+        # Create 3 real database records encrypted under old_key
+        raw_token1 = "test-token-crm-alpha"
+        raw_token2 = "test-token-crm-beta"
+        raw_token3 = "test-token-crm-gamma"
+
+        job1 = ExtractionJob.objects.create(
+            encrypted_token=f_old.encrypt(raw_token1.encode('utf-8')).decode('utf-8'),
+            token_hash=ExtractionJob.hash_token(raw_token1),
+            dedup_hash=ExtractionJob.compute_dedup_hash(raw_token1),
+        )
+        job2 = ExtractionJob.objects.create(
+            encrypted_token=f_old.encrypt(raw_token2.encode('utf-8')).decode('utf-8'),
+            token_hash=ExtractionJob.hash_token(raw_token2),
+            dedup_hash=ExtractionJob.compute_dedup_hash(raw_token2),
+        )
+        job3 = ExtractionJob.objects.create(
+            encrypted_token=f_old.encrypt(raw_token3.encode('utf-8')).decode('utf-8'),
+            token_hash=ExtractionJob.hash_token(raw_token3),
+            dedup_hash=ExtractionJob.compute_dedup_hash(raw_token3),
+        )
+
+        env_file = tmp_path / '.env'
+        env_file.write_text(f"FIELD_ENCRYPTION_KEY={old_key}\nSECRET_KEY=initial\n", encoding='utf-8')
+
+        monkeypatch.setattr('scripts.rotate_secrets.is_tracked_by_git', lambda p: False)
+
+        # Run rotation dropping old key but requesting re-encryption
+        result = rotate_secrets(
+            env_file,
+            keep_old_encryption_key=False,
+            reencrypt=True,
+            dry_run=False,
+        )
+        assert "old keys dropped" in result['FIELD_ENCRYPTION_KEY']
+
+        # Extract new primary key from updated .env
+        updated_content = env_file.read_text(encoding='utf-8')
+        fernet_line = next(line for line in updated_content.splitlines() if line.startswith('FIELD_ENCRYPTION_KEY='))
+        new_primary_key = fernet_line.split('=', 1)[1].strip()
+        assert new_primary_key != old_key
+
+        # Verify that all 3 jobs decrypt with new_primary_key alone
+        assert ExtractionService.count_jobs_dependent_on_old_keys(primary_key=new_primary_key) == 0
+
+        # Verify plaintext tokens are preserved
+        f_new = Fernet(new_primary_key.encode('utf-8'))
+        job1.refresh_from_db()
+        job2.refresh_from_db()
+        job3.refresh_from_db()
+
+        assert f_new.decrypt(job1.encrypted_token.encode('utf-8')).decode('utf-8') == raw_token1
+        assert f_new.decrypt(job2.encrypted_token.encode('utf-8')).decode('utf-8') == raw_token2
+        assert f_new.decrypt(job3.encrypted_token.encode('utf-8')).decode('utf-8') == raw_token3
+
 

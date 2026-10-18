@@ -25,7 +25,11 @@ from apps.common.exceptions import (
     RateLimitExceededError,
     ResourceNotFoundError,
 )
-from apps.extraction.clients import ThirdPartyExtractionClient, parse_retry_after
+from apps.extraction.clients import (
+    ExtractionResult,
+    ThirdPartyExtractionClient,
+    parse_retry_after,
+)
 from apps.extraction.models import ExtractedRecord, ExtractionJob, JobStatus, SourceType
 from apps.extraction.services import ExtractionService
 from config.settings import parse_bool
@@ -1322,5 +1326,105 @@ class TestTargetedConcurrencyAndSecurityEdgeCases:
             # Check log records do not contain secret token
             for record in caplog.records:
                 assert raw_secret_token not in record.message
+
+    def test_recovering_partially_processed_job_does_not_create_duplicate_records(self):
+        """Job Reliability: Partially processed jobs re-run after recovery do not create duplicate records."""
+        job = ExtractionJob.objects.create(
+            source_type=SourceType.CRM,
+            token_hash="tok-dup-test",
+            dedup_hash="dedup-dup-test",
+            status=JobStatus.IN_PROGRESS,
+            start_time=timezone.now() - timezone.timedelta(minutes=30),
+            retry_count=0,
+            max_retries=3,
+        )
+        job.set_encrypted_token("test-tok-val")
+        job.save()
+
+        # Existing partially extracted records from first attempt
+        ExtractedRecord.objects.create(job=job, id_from_service="rec-1", email="user1@example.com")
+        ExtractedRecord.objects.create(job=job, id_from_service="rec-2", email="user2@example.com")
+        assert ExtractedRecord.objects.filter(job=job).count() == 2
+
+        # Stale recovery re-queues job to PENDING
+        recovered = ExtractionService.recover_stale_jobs(timeout_minutes=15)
+        assert recovered == 1
+        job.refresh_from_db()
+        assert job.status == JobStatus.PENDING
+
+        # Mock client returning 3 records (including the 2 existing ones)
+        mock_client = MagicMock()
+        mock_client.extract_data.return_value = ExtractionResult(
+            records=[
+                {'id_from_service': 'rec-1', 'email': 'user1@example.com'},
+                {'id_from_service': 'rec-2', 'email': 'user2@example.com'},
+                {'id_from_service': 'rec-3', 'email': 'user3@example.com'},
+            ],
+            truncated=False
+        )
+
+        service = ExtractionService(client=mock_client)
+        claimed = service.claim_job(job_id=job.id)
+        assert claimed is not None
+        service.process_extraction(job_id=job.id, api_token="test-tok-val", already_claimed=True)
+
+        job.refresh_from_db()
+        assert job.status == JobStatus.COMPLETED
+        # Exactly 3 records in DB (no duplicate rows created for rec-1 and rec-2)
+        assert ExtractedRecord.objects.filter(job=job).count() == 3
+        assert job.record_count == 3
+
+    def test_redirect_cross_host_strips_authorization_header(self):
+        """Security: Cross-host redirects strip Authorization headers to prevent token leakage."""
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+
+        # First request on api.hubapi.com returns 302 redirect to allowed external host
+        resp_302 = MagicMock()
+        resp_302.status_code = 302
+        resp_302.headers = {'Location': 'https://api.thirdparty-crm.com/crm/contacts'}
+
+        # Second request on api.thirdparty-crm.com returns 200 with data
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {'results': [], 'paging': {}}
+
+        captured_headers = []
+
+        def mock_get(url, headers=None, **kwargs):
+            captured_headers.append((url, dict(headers or {})))
+            if 'hubapi.com' in url:
+                return resp_302
+            return resp_200
+
+        with (
+            patch.object(client.session, 'get', side_effect=mock_get),
+            patch.object(ThirdPartyExtractionClient, '_is_host_allowed', return_value=True),
+            patch.object(ThirdPartyExtractionClient, '_resolve_and_validate_host', return_value=(True, '93.184.216.34')),
+        ):
+            client.extract_data(api_token="my-secret-pat-12345", source_type="crm")
+
+        assert len(captured_headers) == 2
+        # First request had Authorization header
+        assert 'Authorization' in captured_headers[0][1]
+        assert captured_headers[0][1]['Authorization'] == 'Bearer my-secret-pat-12345'
+
+        # Second request (cross-host redirect) had Authorization header STRIPPED
+        assert 'Authorization' not in captured_headers[1][1]
+
+    def test_redirect_to_restricted_ip_fails_closed(self):
+        """Security: Redirect target pointing to restricted metadata/loopback IP is blocked."""
+        client = ThirdPartyExtractionClient(base_url="https://api.hubapi.com")
+
+        resp_302 = MagicMock()
+        resp_302.status_code = 302
+        resp_302.headers = {'Location': 'https://169.254.169.254/latest/meta-data/'}
+
+        with (
+            patch.object(client.session, 'get', return_value=resp_302),
+            patch.object(ThirdPartyExtractionClient, '_is_host_allowed', return_value=True),
+            pytest.raises(ExternalServiceError, match="restricted or cannot be resolved"),
+        ):
+            client.extract_data(api_token="test-token", source_type="crm")
+
 
 

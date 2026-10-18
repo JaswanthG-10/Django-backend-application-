@@ -97,7 +97,7 @@ def check_dependent_encrypted_data(primary_key: str | None = None) -> int:
         ) from exc
 
 
-def reencrypt_stored_data(primary_key: str | None = None) -> int:
+def reencrypt_stored_data(primary_key: str | None = None, fallback_keys: list[str] | None = None) -> int:
     """Re-encrypts all stored database records with the specified primary key.
     
     Returns the number of successfully re-encrypted jobs.
@@ -109,7 +109,7 @@ def reencrypt_stored_data(primary_key: str | None = None) -> int:
     os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
     django.setup()
     from apps.extraction.services import ExtractionService
-    return ExtractionService.reencrypt_all_jobs(primary_key=primary_key)
+    return ExtractionService.reencrypt_all_jobs(primary_key=primary_key, fallback_keys=fallback_keys)
 
 
 def rotate_secrets(
@@ -156,8 +156,10 @@ def rotate_secrets(
             for k in old_keys:
                 validate_fernet_key(k)
 
-        # Create timestamped backup
+        # Create timestamped backup (safely avoiding collisions so prior backups are never overwritten)
         backup_path = target.with_name(f"{target.name}.bak-{timestamp}")
+        if backup_path.exists():
+            backup_path = target.with_name(f"{target.name}.bak-{timestamp}-{secrets.token_hex(4)}")
         if not dry_run:
             backup_path.write_text(''.join(existing_lines), encoding='utf-8')
             try:
@@ -180,7 +182,7 @@ def rotate_secrets(
         if dep_count > 0:
             if reencrypt:
                 if not dry_run:
-                    reencrypt_stored_data(primary_key=primary_key)
+                    reencrypt_stored_data(primary_key=primary_key, fallback_keys=old_keys)
                     dep_count = check_dependent_encrypted_data(primary_key=primary_key)
                     if dep_count > 0 and not force_drop:
                         raise RuntimeError(
@@ -229,7 +231,7 @@ def rotate_secrets(
                 if dep_count > 0:
                     if reencrypt:
                         if not dry_run:
-                            reencrypt_stored_data(primary_key=new_fernet_key)
+                            reencrypt_stored_data(primary_key=new_fernet_key, fallback_keys=old_keys)
                             dep_count = check_dependent_encrypted_data(primary_key=new_fernet_key)
                             if dep_count > 0 and not force_drop:
                                 raise RuntimeError(
